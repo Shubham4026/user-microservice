@@ -113,17 +113,33 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn('Kafka is disabled. Skipping user event publish.');
       return; // Do nothing if Kafka is disabled
     }
-
+  
     const topic = this.configService.get<string>('KAFKA_TOPIC', 'user-events');
-    
+    let fullEventType = '';
+    switch (eventType) {
+      case 'created':
+        fullEventType = 'USER_CREATED';
+        break;
+      case 'updated':
+        fullEventType = 'USER_UPDATED';
+        break;
+      case 'deleted':
+        fullEventType = 'USER_DELETED';
+        break;
+      default:
+        fullEventType = 'UNKNOWN_EVENT';
+        break;
+    }
+  
     const payload = {
-      eventType,
+      eventType: fullEventType,
       timestamp: new Date().toISOString(),
       userId,
       data: userData
     };
-
+  
     await this.publishMessage(topic, payload, userId);
-    this.logger.log(`User ${eventType} event published for user ${userId}`);
+    this.logger.log(`User ${fullEventType} event published for user ${userId}`);
   }
+  
 }
