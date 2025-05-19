@@ -1471,12 +1471,16 @@ export class PostgresFieldsService implements IServicelocatorfields {
 
       if (optionSelected) {
         if (whereCond) {
-          whereCond += `AND "${tableName}_name" ILike '%${optionSelected}%'`;
+          whereCond += ` AND "${tableName}_name" ILike '%${optionSelected}%' AND is_active = 1`;
         } else {
-          whereCond += `WHERE "${tableName}_name" ILike '%${optionSelected}%'`;
+          whereCond += `WHERE "${tableName}_name" ILike '%${optionSelected}%' AND is_active = 1`;
         }
       } else {
-        whereCond += "";
+        if (whereCond) {
+          whereCond += ` AND is_active = 1`;
+        } else {
+          whereCond += `WHERE is_active = 1`;
+        }
       }
 
       const query = `SELECT *,COUNT(*) OVER() AS total_count FROM public."${tableName}" ${whereCond} ${orderCond} ${offsetCond} ${limitCond}`;
