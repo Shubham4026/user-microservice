@@ -71,6 +71,7 @@ export class PostgresUserService implements IServicelocator {
   jwt_secret: any;
   reset_frontEnd_url: any;
   //SMS notification
+  private readonly msg91TemplateKey: string;
   private readonly otpExpiry: number;
   private readonly otpDigits: number;
   private readonly smsKey: string;
@@ -116,6 +117,7 @@ export class PostgresUserService implements IServicelocator {
     this.otpDigits = this.configService.get<number>("OTP_DIGITS") || 6;
     this.smsKey = this.configService.get<string>("SMS_KEY");
     this.dataSource = dataSource; // Store dataSource in class property
+    this.msg91TemplateKey = this.configService.get<string>("MSG91_TEMPLATE_KEY");
   }
 
   public async getCoreColumnNames() {
@@ -2519,13 +2521,12 @@ export class PostgresUserService implements IServicelocator {
         reason
       );
       const replacements = {
-        "{OTP}": otp,
-        "{otpExpiry}": expiresInMinutes,
+        "{var1}": otp
       };
       // Step 2:send SMS notification
       const notificationPayload = await this.smsNotification(
         "OTP",
-        "SEND_OTP",
+        this.msg91TemplateKey,
         replacements,
         [mobile]
       );
