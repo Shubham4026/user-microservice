@@ -10,7 +10,7 @@ import {
 
 @Entity({ name: "Cohort" })
 export class Cohort {
-  @PrimaryGeneratedColumn('uuid')  
+  @PrimaryGeneratedColumn("uuid")
   cohortId: string;
 
   @Column({ nullable: true })
@@ -22,11 +22,11 @@ export class Cohort {
   @Column({ nullable: true })
   type: string;
 
-  @Column({ nullable: true })
-  status: boolean;
+  @Column()
+  status: string;
 
-  @Column({ nullable: true })
-  image: string;
+  @Column({ type: "json", nullable: true })
+  image: string[]; // JSON field to store array of program images
 
   @Column({ nullable: true })
   referenceId: string;
@@ -60,5 +60,4 @@ export class Cohort {
 
   @Column()
   updatedBy: string;
-
 }

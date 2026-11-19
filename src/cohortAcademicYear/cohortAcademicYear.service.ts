@@ -1,0 +1,151 @@
+import { HttpStatus, Injectable } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { CohortAcademicYear } from "src/cohortAcademicYear/entities/cohortAcademicYear.entity";
+import { Repository } from "typeorm";
+import { Request, Response } from "express";
+import { CohortAcademicYearDto } from "src/cohortAcademicYear/dto/cohort-academicyear.dto";
+import { APIID } from "@utils/api-id.config";
+import APIResponse from "src/common/responses/response";
+import { KafkaService } from "src/kafka/kafka.service";
+import { LoggerUtil } from "src/common/logger/LoggerUtil";
+import { API_RESPONSES } from "@utils/response.messages";
+import { AcademicYearService } from "src/academicyears/academicyears.service";
+import { Cohort } from "src/cohort/entities/cohort.entity";
+
+@Injectable()
+export class CohortAcademicYearService {
+
+  constructor(
+    private readonly academicYearService: AcademicYearService,
+    @InjectRepository(Cohort)
+    private readonly cohortRepository: Repository<Cohort>,
+    @InjectRepository(CohortAcademicYear)
+    private readonly cohortAcademicYearRepository: Repository<CohortAcademicYear>,
+    private readonly kafkaService: KafkaService,
+  ) { }
+
+  async createCohortAcademicYear(tenantId: string, request: Request, cohortAcademicYearDto: CohortAcademicYearDto, response: Response) {
+    const apiId = APIID.ADD_COHORT_TO_ACADEMIC_YEAR;
+    try {
+      const existingCohort = await this.cohortRepository.findOne({
+        where: { cohortId: cohortAcademicYearDto.cohortId, status: 'active' },
+      });
+
+      if (!existingCohort) {
+        return APIResponse.error(
+          response,
+          apiId,
+          HttpStatus.NOT_FOUND.toLocaleString(),
+          API_RESPONSES.COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      if (existingCohort.tenantId !== tenantId) {
+        return APIResponse.error(
+          response,
+          apiId,
+          HttpStatus.BAD_REQUEST.toLocaleString(),
+          API_RESPONSES.TENANTID_MISMATCHED,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      // verify if the academic year id is valid
+      const academicYear =
+        await this.academicYearService.getActiveAcademicYear(
+          cohortAcademicYearDto.academicYearId,
+          tenantId
+        );
+
+      if (!academicYear) {
+        return APIResponse.error(
+          response,
+          apiId,
+          HttpStatus.NOT_FOUND.toLocaleString(),
+          API_RESPONSES.ACADEMICYEAR_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      const createdAcademicYear = await this.insertCohortAcademicYear(cohortAcademicYearDto.cohortId, cohortAcademicYearDto.academicYearId, cohortAcademicYearDto.createdBy, cohortAcademicYearDto.updatedBy, tenantId);
+
+      if (createdAcademicYear) {
+        const apiResponse = APIResponse.success(
+          response,
+          apiId,
+          createdAcademicYear,
+          HttpStatus.OK,
+          API_RESPONSES.ADD_COHORT_TO_ACADEMIC_YEAR
+        );
+
+        return apiResponse;
+      }
+
+    } catch (error) {
+      const errorMessage = error.message || "Internal server error";
+      return APIResponse.error(
+        response,
+        apiId,
+        "Internal Server Error",
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  async insertCohortAcademicYear(
+    cohortId: string,
+    academicYearId: string,
+    createdBy: string,
+    updatedBy: string,
+    tenantId?: string
+  ) {
+    const cohortAcademicYear = new CohortAcademicYear();
+    cohortAcademicYear.cohortId = cohortId;
+    cohortAcademicYear.academicYearId = academicYearId;
+    cohortAcademicYear.createdBy = createdBy;
+    cohortAcademicYear.updatedBy = updatedBy;
+
+    const saved = await this.cohortAcademicYearRepository.save(cohortAcademicYear);
+
+    // Publish COHORT_ACADEMIC_YEAR_CREATED event to Kafka (fire-and-forget)
+    const enrichedData = { ...saved, tenantId };
+    this.kafkaService.publishCohortAcademicYearEvent('created', enrichedData, saved.cohortAcademicYearId)
+      .then(() => console.log('COHORT_ACADEMIC_YEAR_CREATED event published successfully'))
+      .catch(error => {
+        LoggerUtil.error(
+          `Failed to publish cohort academic year created event to Kafka`,
+          `Error: ${error.message}`,
+          'insertCohortAcademicYear'
+        );
+      });
+
+    return saved;
+  }
+
+  async getCohortsAcademicYear(
+    academicYearId: string,
+    tenantId: string
+  ): Promise<CohortAcademicYear[]> {
+    const query = `
+      SELECT cay.*
+      FROM public."CohortAcademicYear" cay
+      INNER JOIN public."AcademicYears" ay
+        ON cay."academicYearId" = ay."id"
+      WHERE cay."academicYearId" = $1
+        AND ay."tenantId" = $2`;
+
+    return await this.cohortAcademicYearRepository.query(query, [
+      academicYearId,
+      tenantId,
+    ]);
+  }
+
+  async isCohortExistForYear(yearId, cohortId) {
+    return await this.cohortAcademicYearRepository.find({
+      where: { academicYearId: yearId, cohortId: cohortId },
+    });
+  }
+
+}

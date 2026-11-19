@@ -1,40 +1,57 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
-@Entity({ name: 'FieldValues' })
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  ManyToOne,
+  JoinColumn,
+} from "typeorm";
+import { v4 as uuidv4 } from "uuid";
+import { Fields } from "./fields.entity";
+
+@Entity("FieldValues", { schema: "public" })
 export class FieldValues {
+  @PrimaryGeneratedColumn("uuid", { name: "fieldValuesId" })
+  fieldValuesId: string = uuidv4();
 
-    @Column({ type: 'text', nullable: false })
-    value: string;
+  @Column("varchar", { length: 255, nullable: false })
+  value: string;
 
-    @PrimaryGeneratedColumn('uuid') 
-    fieldValuesId: string;
+  @Column("uuid", { nullable: false })
+  itemId: string;
 
-    @Column({ type: 'uuid', nullable: false, default: () => 'gen_random_uuid()' })
-    itemId: string;
+  @Column("uuid", { nullable: false })
+  fieldId: string;
 
-    @Column({ type: 'uuid', nullable: false, name: 'fieldId' })
-    fieldId: string;
+  @Column("uuid", { nullable: true })
+  tenantId?: string;
 
-    @CreateDateColumn({
-        type: "timestamp with time zone",
-        default: () => "CURRENT_TIMESTAMP",
-    })
-    createdAt: Date;
+  @Column("varchar", { nullable: true })
+  contextType?: string;
 
-    @UpdateDateColumn({
-        type: "timestamp with time zone",
-        default: () => "CURRENT_TIMESTAMP",
-    })
-    updatedAt: Date;
 
-    @CreateDateColumn({
-        type: "timestamp with time zone",
-        default: () => "CURRENT_TIMESTAMP",
-    })
-    createdBy: Date;
+  @CreateDateColumn({
+    type: "timestamptz",
+    default: () => "now()",
+    nullable: false,
+  })
+  createdAt: Date;
 
-    @UpdateDateColumn({
-        type: "timestamp with time zone",
-        default: () => "CURRENT_TIMESTAMP",
-    })
-    updatedBy: Date;
+  @UpdateDateColumn({
+    type: "timestamptz",
+    default: () => "now()",
+    nullable: false,
+  })
+  updatedAt: Date;
+
+  @Column("uuid", { nullable: true })
+  createdBy?: string;
+
+  @Column("uuid", { nullable: true })
+  updatedBy?: string;
+
+  @ManyToOne(() => Fields, (field) => field.fieldValues)
+  @JoinColumn({ name: "fieldId" })
+  field: Fields;
 }

@@ -1,37 +1,74 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, UsePipes, ValidationPipe, Req, Res, SerializeOptions, Headers, UseGuards, UseFilters } from '@nestjs/common';
-import { AssignRoleAdapter } from './assign-role.apater';
-import { CreateAssignRoleDto } from './dto/create-assign-role.dto';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
+  UsePipes,
+  ValidationPipe,
+  Req,
+  Res,
+  SerializeOptions,
+  Headers,
+  UseGuards,
+  UseFilters,
+  ParseUUIDPipe,
+  BadRequestException,
+} from "@nestjs/common";
+import { AssignRoleService } from "./assign-role.service";
+import { CreateAssignRoleDto } from "./dto/create-assign-role.dto";
 import { Response, Request } from "express";
-import { ApiBasicAuth, ApiCreatedResponse, ApiBody, ApiForbiddenResponse, ApiHeader, ApiOkResponse, ApiTags, ApiBadRequestResponse, ApiInternalServerErrorResponse, ApiConflictResponse, ApiNotFoundResponse } from '@nestjs/swagger';
+import {
+  ApiBasicAuth,
+  ApiCreatedResponse,
+  ApiBody,
+  ApiForbiddenResponse,
+  ApiHeader,
+  ApiOkResponse,
+  ApiTags,
+  ApiBadRequestResponse,
+  ApiInternalServerErrorResponse,
+  ApiConflictResponse,
+  ApiNotFoundResponse,
+} from "@nestjs/swagger";
 import { JwtAuthGuard } from "src/common/guards/keycloak.guard";
-import { DeleteAssignRoleDto } from './dto/delete-assign-role.dto';
-import { AllExceptionsFilter } from 'src/common/filters/exception.filter';
-import { APIID } from 'src/common/utils/api-id.config';
+import { DeleteAssignRoleDto } from "./dto/delete-assign-role.dto";
+import { BulkAssignRoleDto } from "./dto/bulk-assign-role.dto";
+import { AllExceptionsFilter } from "src/common/filters/exception.filter";
+import { APIID } from "src/common/utils/api-id.config";
+import { GetUserId } from "src/common/decorators/getUserId.decorator";
 
-
-@ApiTags('rbac')
-@Controller('rbac/usersRoles')
+@ApiTags("rbac")
+@Controller("rbac/usersRoles")
 @UseGuards(JwtAuthGuard)
 export class AssignRoleController {
-  constructor(private readonly assignRoleAdpater: AssignRoleAdapter) { }
+  constructor(private readonly assignRoleService: AssignRoleService) { }
 
   @UseFilters(new AllExceptionsFilter(APIID.USERROLE_CREATE))
   @Post()
   @UsePipes(new ValidationPipe())
   @ApiBasicAuth("access-token")
-  @ApiCreatedResponse({ description: "Role assigned successfully to the user in the specified tenant." })
+  @ApiCreatedResponse({
+    description:
+      "Role assigned successfully to the user in the specified tenant.",
+  })
   @ApiBadRequestResponse({ description: "Bad request." })
   @ApiInternalServerErrorResponse({ description: "Internal Server Error." })
-  @ApiConflictResponse({ description: "Role is already assigned to this user." })
+  @ApiConflictResponse({
+    description: "Role is already assigned to this user.",
+  })
   @ApiBody({ type: CreateAssignRoleDto })
   // @ApiHeader({ name: "tenantid" })
   public async create(
     @Req() request: Request,
     @Body() createAssignRoleDto: CreateAssignRoleDto,
     @Res() response: Response,
-    @Headers() headers,
+    @Headers() headers
   ) {
-    return await this.assignRoleAdpater.buildassignroleAdapter().createAssignRole(request, createAssignRoleDto, response);
+    return await this.assignRoleService
+      .createAssignRole(createAssignRoleDto, response);
     // return response.status(result.statusCode).json(result);
   }
 
@@ -41,13 +78,14 @@ export class AssignRoleController {
   @ApiOkResponse({ description: "Role Detail." })
   @ApiHeader({ name: "tenantid" })
   @ApiForbiddenResponse({ description: "Forbidden" })
-  @SerializeOptions({ strategy: "excludeAll", })
+  @SerializeOptions({ strategy: "excludeAll" })
   public async getRole(
     @Param("userId") userId: string,
     @Req() request: Request,
     @Res() response: Response
   ) {
-    return await this.assignRoleAdpater.buildassignroleAdapter().getAssignedRole(userId, request, response);
+    return await this.assignRoleService
+      .getAssignedRole(userId, response);
     // return response.status(result.statusCode).json(result);
   }
 
@@ -59,13 +97,40 @@ export class AssignRoleController {
   @ApiNotFoundResponse({ description: "Data not found" })
   @ApiBadRequestResponse({ description: "Bad request" })
   public async deleteRole(
+    @Req() request: Request,
     @Body() deleteAssignRoleDto: DeleteAssignRoleDto, // Modify this line to accept DeleteAssignRoleDto
     @Res() response: Response
   ) {
-    return await this.assignRoleAdpater
-      .buildassignroleAdapter()
+    return await this.assignRoleService
       .deleteAssignedRole(deleteAssignRoleDto, response);
-    // return response.status(result.statusCode).json(result);
   }
 
+  @UseFilters(new AllExceptionsFilter(APIID.USERROLE_BULK_UPDATE))
+  @Patch("/bulkUpdate")
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @ApiBody({ type: BulkAssignRoleDto })
+  @ApiOkResponse({ description: "User roles updated successfully" })
+  @ApiBadRequestResponse({ description: "Bad request." })
+  @ApiNotFoundResponse({ description: "User not found in UserRolesMapping" })
+  @ApiInternalServerErrorResponse({ description: "Internal Server Error." })
+  @ApiHeader({ name: "tenantid", required: true })
+  public async bulkUpdateUserRoles(
+    @Req() request: Request,
+    @Body() dto: BulkAssignRoleDto,
+    @Headers() headers,
+    @Res() response: Response,
+    @GetUserId("userId", ParseUUIDPipe) userId: string
+  ) {
+    const tenantId = headers["tenantid"];
+    if (!tenantId) {
+      throw new BadRequestException("Tenant ID is required.");
+    }
+    return await this.assignRoleService.bulkUpdateUserRoles(
+      dto.userIds,
+      dto.roleId,
+      tenantId,
+      userId,
+      response
+    );
+  }
 }

@@ -1,28 +1,42 @@
 import { Module } from "@nestjs/common";
 import { HttpModule } from "@nestjs/axios";
+import { ThrottlerModule } from "@nestjs/throttler";
 import { AuthController } from "./auth.controller";
 import { AuthService } from "./auth.service";
 import { JwtStrategy } from "src/common/guards/keycloak.strategy";
 import { RbacJwtStrategy } from "src/common/guards/rbac.strategy";
-import { UserAdapter } from "../user/useradapter";
+import { UserModule } from "../user/user.module";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { User } from "../user/entities/user-entity";
-import { FieldValues } from "../user/entities/field-value-entities";
-import { Field } from "src/user/entities/field-entity";
+import { FieldValues } from "src/fields/entities/fields-values.entity";
+import { Fields } from "src/fields/entities/fields.entity";
 import { CohortMembers } from "src/cohortMembers/entities/cohort-member.entity";
 import { KeycloakService } from "src/common/utils/keycloak.service";
-import { HasuraUserService } from "src/adapters/hasura/user.adapter";
-import { PostgresUserService } from "src/adapters/postgres/user-adapter";
-import { FieldsService } from "src/adapters/hasura/services/fields.service";
-import { HasuraModule } from "src/adapters/hasura/hasura.module";
-import { PostgresModule } from "src/adapters/postgres/potsgres-module";
+import { RolePermissionModule } from "src/permissionRbac/rolePermissionMapping/role-permission.module";
+import { RolePermissionService } from "src/permissionRbac/rolePermissionMapping/role-permission-mapping.service";
+import { RolePermission } from "src/permissionRbac/rolePermissionMapping/entities/rolePermissionMapping";
+import { PasswordEncryptionService } from "src/common/services/password-encryption.service";
+import { CaptchaService } from "src/common/services/captcha.service";
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, FieldValues, Field, CohortMembers]),
+    TypeOrmModule.forFeature([
+      User,
+      FieldValues,
+      Fields,
+      CohortMembers,
+      RolePermission,
+    ]),
     HttpModule,
-    HasuraModule,
-    PostgresModule,
+    RolePermissionModule,
+    UserModule,
+    ThrottlerModule.forRoot([
+      {
+        name: "login",
+        ttl: 60000,
+        limit: 5,
+      },
+    ]),
   ],
   controllers: [AuthController],
   providers: [
@@ -30,7 +44,10 @@ import { PostgresModule } from "src/adapters/postgres/potsgres-module";
     JwtStrategy,
     RbacJwtStrategy,
     KeycloakService,
-    UserAdapter,
+    RolePermissionService,
+    PasswordEncryptionService,
+    CaptchaService,
   ],
+  exports: [PasswordEncryptionService],
 })
 export class AuthModule {}

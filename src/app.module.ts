@@ -1,7 +1,8 @@
-import { Module } from "@nestjs/common";
+import { MiddlewareConsumer, Module, RequestMethod } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { AppController } from "./app.controller";
 import { AppService } from "./app.service";
+import { AuditLoggerModule } from "@tekdi/audit-logger/nestjs";
 // import { MulterModule } from "@nestjs/platform-express/multer";
 // Below modules not in use for Shiksha 2.0
 
@@ -15,29 +16,65 @@ import { AuthRbacModule } from "./authRbac/authRbac.module";
 import { CohortModule } from "./cohort/cohort.module";
 import { CohortMembersModule } from "./cohortMembers/cohortMembers.module";
 import { FieldsModule } from "./fields/fields.module";
-import { AttendanceModule } from "./attendance/attendance.module";
 import { UserModule } from "./user/user.module";
 import { RbacModule } from "./rbac/rbac.module";
-import { AssignTenantModule } from './userTenantMapping/user-tenant-mapping.module';
+import { UserTenantMappingModule } from "./userTenantMapping/user-tenant-mapping.module";
+import { FormsModule } from "./forms/forms.module";
+import { HttpService } from "@utils/http-service";
+import { TenantModule } from "./tenant/tenant.module";
+import { AcademicyearsModule } from "./academicyears/academicyears.module";
+import { CohortAcademicYearModule } from "./cohortAcademicYear/cohortAcademicYear.module";
+import { AutomaticMemberModule } from "./automatic-member/automatic-member.module";
+import { PermissionMiddleware } from "./middleware/permission.middleware";
+import { RolePermissionModule } from "./permissionRbac/rolePermissionMapping/role-permission.module";
+import { LocationModule } from "./location/location.module";
+import { KafkaModule } from "./kafka/kafka.module";
+import { SsoModule } from "./sso/sso.module";
+import kafkaConfig from "./kafka/kafka.config";
+import { HealthController } from "./health.controller";
+import { CronModule } from "./cron/cron.module";
+import { CacheModule } from "./cache/cache.module";
+import { RequestContextMiddleware } from "./common/middleware/request-context.middleware";
 
 @Module({
   imports: [
     RbacModule,
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({
+      load: [kafkaConfig], // Load the Kafka config
+      isGlobal: true, // Makes config accessible globally
+    }),
+    AuditLoggerModule.forRoot({
+      serviceName: process.env.AUDIT_SERVICE_NAME || 'user-service',
+      kafkaTopic: 'audit.events',
+    }),
     // MulterModule.register({
     //   dest: "./uploads",
     // }),
     UserModule,
-    AttendanceModule,
     CohortModule,
     CohortMembersModule,
-    AssignTenantModule,
+    UserTenantMappingModule,
     FieldsModule,
     AuthModule,
     AuthRbacModule,
     DatabaseModule,
+    FormsModule,
+    TenantModule,
+    AcademicyearsModule,
+    CohortAcademicYearModule,
+    AutomaticMemberModule,
+    RolePermissionModule,
+    LocationModule,
+    KafkaModule,
+    SsoModule,
+    CronModule,
+    CacheModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
+  controllers: [AppController, HealthController],
+  providers: [AppService, HttpService],
 })
-export class AppModule {}
+export class AppModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(RequestContextMiddleware).forRoutes("*");
+  }
+}

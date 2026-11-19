@@ -35,16 +35,16 @@ import {
 import { Request } from "@nestjs/common";
 import { Response, response } from "express";
 import { JwtAuthGuard } from "src/common/guards/keycloak.guard";
-import { PrivilegeAdapter } from "./privilegeadapter";
+import { PrivilegeService } from "./privilege.service";
 import { v4 as uuidv4 } from "uuid";
 import { AllExceptionsFilter } from "src/common/filters/exception.filter";
 import { APIID } from "src/common/utils/api-id.config";
 
 @UseGuards(JwtAuthGuard)
 @ApiTags("rbac")
-@Controller('rbac/privileges')
+@Controller("rbac/privileges")
 export class PrivilegeController {
-  constructor(private readonly privilegeAdapter: PrivilegeAdapter) { }
+  constructor(private readonly privilegeService: PrivilegeService) {}
 
   @UseFilters(new AllExceptionsFilter(APIID.PRIVILEGE_BYROLEID))
   @Get()
@@ -52,16 +52,16 @@ export class PrivilegeController {
   @ApiOkResponse({ description: "Privilege Detail." })
   @ApiBadRequestResponse({ description: "Bad Request" })
   @ApiInternalServerErrorResponse({ description: "Internal Server Error" })
-  @SerializeOptions({ strategy: "excludeAll", })
+  @SerializeOptions({ strategy: "excludeAll" })
   public async getPrivilegebyRoleId(
     @Query("tenantId") tenantId: string,
     @Query("roleId") roleId: string,
     @Req() request: Request,
     @Res() response: Response
   ) {
-    return await this.privilegeAdapter.buildPrivilegeAdapter().getPrivilegebyRoleId(tenantId, roleId, request, response);
+    return await this.privilegeService
+      .getPrivilegebyRoleId(tenantId, roleId, request, response);
   }
-
 
   @UseFilters(new AllExceptionsFilter(APIID.PRIVILEGE_BYPRIVILEGEID))
   @Get("/:privilegeId")
@@ -76,13 +76,9 @@ export class PrivilegeController {
     @Req() request: Request,
     @Res() response: Response
   ) {
-    return await this.privilegeAdapter
-      .buildPrivilegeAdapter()
+    return await this.privilegeService
       .getPrivilege(privilegeId, request, response);
   }
-
-
-
 
   @UseFilters(new AllExceptionsFilter(APIID.PRIVILEGE_CREATE))
   @Post("/create")
@@ -101,8 +97,7 @@ export class PrivilegeController {
     @Body() createPrivilegesDto: CreatePrivilegesDto,
     @Res() response: Response
   ) {
-    return await this.privilegeAdapter
-      .buildPrivilegeAdapter()
+    return await this.privilegeService
       .createPrivilege(request.user.userId, createPrivilegesDto, response);
   }
 
@@ -152,8 +147,7 @@ export class PrivilegeController {
     @Param("privilegeId", ParseUUIDPipe) privilegeId: string,
     @Res() response: Response
   ) {
-    return await this.privilegeAdapter
-      .buildPrivilegeAdapter()
+    return await this.privilegeService
       .deletePrivilege(privilegeId, response);
   }
 }

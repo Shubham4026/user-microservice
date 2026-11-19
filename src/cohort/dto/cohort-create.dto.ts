@@ -1,18 +1,23 @@
-import { Exclude, Expose } from "class-transformer";
+import { Expose, Type } from "class-transformer";
 import {
   IsNotEmpty,
+  IsOptional,
+  ValidateNested,
+  IsEnum,
+  IsArray,
   IsString,
-  IsOptional
 } from "class-validator";
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
-import { FieldValuesCreateDto } from "src/fields/dto/field-values-create.dto";
+import { FieldValuesOptionDto } from "src/user/dto/user-create.dto";
 
 export class CohortCreateDto {
   @Expose()
   cohortId: string;
-  
+
   @Expose()
   tenantId: string;
+
+  academicYearId: string;
 
   @Expose()
   createdAt: string;
@@ -63,21 +68,40 @@ export class CohortCreateDto {
   type: string;
 
   //status
+  // @Expose()
+  // status: string;
+  @ApiProperty({
+    type: String,
+    description: "The status of Cohort",
+  })
+  @IsOptional()
+  @IsEnum(["active", "archived", "inactive", "pending"], {
+    message: "Status must be one of: active, archived, inactive, pending",
+  })
   @Expose()
-  status: boolean;
+  status: string;
 
   //attendanceCaptureImage
   @Expose()
   attendanceCaptureImage: boolean;
 
-  //image need for future
-  // @Expose()
-  // @ApiPropertyOptional({ type: "string", format: "binary" })
-  // image: string;
+  //file path
+  @ApiPropertyOptional({ type: () => [String] })
+  @IsArray()
+  @IsString({ each: true })    
+  @IsOptional()
+  image: string[];
 
   //metadata
+  @ApiPropertyOptional({
+    type: String,
+    description: "Metadata as JSON string (e.g., '{\"blockId\": \"881\"}')",
+    example: '{"blockId": "881"}',
+  })
   @Expose()
-  metadata: string;
+  @IsOptional()
+  @IsString()
+  metadata?: string;
 
   //createdBy
   @Expose()
@@ -88,19 +112,56 @@ export class CohortCreateDto {
   updatedBy: string;
 
   //fieldValues
+  //fieldValues
   @ApiPropertyOptional({
-    type: String,
+    type: [FieldValuesOptionDto],
     description: "The fieldValues Object",
   })
-  @IsString()
-  @IsOptional()
-  @Expose()
-  fieldValues?: string;
-
+  @ValidateNested({ each: true })
+  @Type(() => FieldValuesOptionDto)
+  customFields: FieldValuesOptionDto[];
+  // @ApiPropertyOptional({
+  //   type: String,
+  //   description: "The fieldValues Object",
+  // })
+  // @IsString()
+  // @IsOptional()
+  // @Expose()
+  // fieldValues?: string;
 
   constructor(obj?: Partial<CohortCreateDto>) {
     if (obj) {
       Object.assign(this, obj);
     }
+  }
+}
+
+export class ReturnResponseBody {
+  @Expose()
+  cohortId: string;
+  @Expose()
+  parentId: string;
+  @Expose()
+  name: string;
+  @Expose()
+  type: string;
+  @Expose()
+  status: string;
+  @Expose()
+  tenantId: string;
+  @Expose()
+  academicYearId: string;
+  @Expose()
+  image: string[];
+
+  constructor(cohortDto: CohortCreateDto) {
+    this.cohortId = cohortDto.cohortId;
+    this.parentId = cohortDto.parentId;
+    this.name = cohortDto.name;
+    this.type = cohortDto.type;
+    this.status = cohortDto.status;
+    this.tenantId = cohortDto.tenantId;
+    this.academicYearId = cohortDto.academicYearId;
+    this.image = cohortDto.image;
   }
 }

@@ -21,6 +21,7 @@ import {
   UseGuards,
   UseFilters,
 } from "@nestjs/common";
+import { LoginThrottlerGuard } from "./login-throttler.guard";
 import {
   AuthDto,
   RefreshTokenRequestBody,
@@ -31,20 +32,26 @@ import { JwtAuthGuard } from "src/common/guards/keycloak.guard";
 import { APIID } from "src/common/utils/api-id.config";
 import { AllExceptionsFilter } from "src/common/filters/exception.filter";
 import { Response } from "express";
+import { PasswordEncryptionService } from "src/common/services/password-encryption.service";
+import APIResponse from "src/common/responses/response";
 
 @ApiTags("Auth")
 @Controller("auth")
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private passwordEncryptionService: PasswordEncryptionService
+  ) {}
 
   @UseFilters(new AllExceptionsFilter(APIID.LOGIN))
+  @UseGuards(LoginThrottlerGuard)
   @Post("/login")
   @ApiBody({ type: AuthDto })
   @UsePipes(ValidationPipe)
   @HttpCode(HttpStatus.OK)
   @ApiForbiddenResponse({ description: "Forbidden" })
   public async login(@Body() authDto: AuthDto, @Res() response: Response) {
-    return this.authService.login(authDto,response);
+    return this.authService.login(authDto, response);
   }
 
   @UseFilters(new AllExceptionsFilter(APIID.USER_AUTH))
@@ -57,7 +64,8 @@ export class AuthController {
     strategy: "excludeAll",
   })
   public async getUserByAuth(@Req() request, @Res() response: Response) {
-    return this.authService.getUserByAuth(request, response);
+    const tenantId = request?.headers["tenantid"];
+    return this.authService.getUserByAuth(request, tenantId, response);
   }
 
   @UseFilters(new AllExceptionsFilter(APIID.REFRESH))
@@ -65,10 +73,13 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @ApiBody({ type: RefreshTokenRequestBody })
   @UsePipes(ValidationPipe)
-  refreshToken(@Body() body: RefreshTokenRequestBody, @Res() response: Response) {
+  refreshToken(
+    @Body() body: RefreshTokenRequestBody,
+    @Res() response: Response
+  ) {
     const { refresh_token: refreshToken } = body;
 
-    return this.authService.refreshToken(refreshToken,response);
+    return this.authService.refreshToken(refreshToken, response);
   }
 
   @UseFilters(new AllExceptionsFilter(APIID.LOGOUT))
@@ -79,6 +90,25 @@ export class AuthController {
   async logout(@Body() body: LogoutRequestBody, @Res() response: Response) {
     const { refresh_token: refreshToken } = body;
 
-    await this.authService.logout(refreshToken,response);
+    await this.authService.logout(refreshToken, response);
+  }
+
+  @UseFilters(new AllExceptionsFilter(APIID.AUTH_PUBLIC_KEY))
+  @Get("/public-key")
+  @HttpCode(HttpStatus.OK)
+  @ApiOkResponse({ description: "RSA public key used to encrypt sensitive fields." })
+  public async getPublicKey(@Res() response: Response) {
+    const result = {
+      keyId: this.passwordEncryptionService.getKeyId(),
+      publicKey: this.passwordEncryptionService.getPublicKey(),
+    };
+
+    return APIResponse.success(
+      response,
+      APIID.AUTH_PUBLIC_KEY,
+      result,
+      HttpStatus.OK,
+      "Public key fetched successfully."
+    );
   }
 }

@@ -1,332 +1,1958 @@
 import { ConsoleLogger, HttpStatus, Injectable } from "@nestjs/common";
-import { CohortInterface } from "./interfaces/cohort.interface";
-import { HttpService } from "@nestjs/axios";
-import { SuccessResponse } from "src/success-response";
-import { ErrorResponse } from "src/error-response";
-const resolvePath = require("object-resolve-path");
-import jwt_decode from "jwt-decode";
-import { CohortDto } from "src/cohort/dto/cohort.dto";
-import { CohortSearchDto } from "src/cohort/dto/cohort-search.dto";
-import { UserDto } from "src/user/dto/user.dto";
-import { CohortCreateDto } from "src/cohort/dto/cohort-create.dto";
-import { FieldValuesDto } from "src/fields/dto/field-values.dto";
-import { FieldValuesSearchDto } from "src/fields/dto/field-values-search.dto";
-import { IsNull, Not, Repository, getConnection, getRepository } from "typeorm";
-import { Cohort } from "src/cohort/entities/cohort.entity";
+import { AuditLoggerService } from "@tekdi/audit-logger/nestjs";
+import { ReturnResponseBody } from "./dto/cohort-create.dto";
+import { CohortSearchDto } from "./dto/cohort-search.dto";
+import { CohortCreateDto } from "./dto/cohort-create.dto";
+import { CohortUpdateDto } from "./dto/cohort-update.dto";
+import { IsNull, Repository, In, ILike, Not } from "typeorm";
+import { Cohort } from "./entities/cohort.entity";
+import { Fields } from "src/fields/entities/fields.entity";
 import { InjectRepository } from "@nestjs/typeorm";
-import { FieldsService } from "../fields/fields.service";
-// import { FieldValues } from "src/fields/entities/field-values.entity";
-import { response } from "express";
-import APIResponse from "src/utils/response";
-import { FieldValues } from "../fields/entities/fields-values.entity";
-import { v4 as uuidv4 } from "uuid";
-import { CohortMembers } from "src/cohortMembers/entities/cohort-member.entity";
-import { ErrorResponseTypeOrm } from "src/error-response-typeorm";
+import { FieldsService } from "src/fields/fields.service";
+import { FieldValues } from "src/fields/entities/fields-values.entity";
+import {
+  CohortMembers,
+  MemberStatus,
+} from "src/cohortMembers/entities/cohort-member.entity";
+import { isUUID } from "class-validator";
+import { UserTenantMapping } from "src/userTenantMapping/entities/user-tenant-mapping.entity";
+import APIResponse from "src/common/responses/response";
+import { APIID } from "src/common/utils/api-id.config";
+import { CohortAcademicYearService } from "src/cohortAcademicYear/cohortAcademicYear.service";
+import { AcademicYearService } from "src/academicyears/academicyears.service";
+import { API_RESPONSES } from "@utils/response.messages";
+import { CohortAcademicYear } from "src/cohortAcademicYear/entities/cohortAcademicYear.entity";
+import { CohortMembersService } from "src/cohortMembers/cohortMembers.service";
+import { LoggerUtil } from "src/common/logger/LoggerUtil";
+import { AutomaticMemberService } from "src/automatic-member/automatic-member.service";
+import { KafkaService } from "src/kafka/kafka.service";
+import { Console } from "console";
+import { CacheService } from "../cache/cache.service";
+import { hashCacheKey } from "../cache/cache-key.util";
+
+const COHORT_TTL_SECONDS = 300; // cohort:{tenantId}, 5 min
+import { getAuditContext } from "@utils/audit-helper";
 
 @Injectable()
 export class CohortService {
-  private cohort: CohortInterface;
-
   constructor(
     @InjectRepository(Cohort)
     private cohortRepository: Repository<Cohort>,
     @InjectRepository(CohortMembers)
     private cohortMembersRepository: Repository<CohortMembers>,
-    private fieldsService: FieldsService
-  ) {}
+    @InjectRepository(FieldValues)
+    private fieldValuesRepository: Repository<FieldValues>,
+    @InjectRepository(Fields)
+    private fieldsRepository: Repository<Fields>,
+    @InjectRepository(UserTenantMapping)
+    private UserTenantMappingRepository: Repository<UserTenantMapping>,
+    private fieldsService: FieldsService,
+    private readonly cohortAcademicYearService: CohortAcademicYearService,
+    private readonly academicYearService: AcademicYearService,
+    private readonly cohortMembersService: CohortMembersService,
+    private readonly automaticMemberService: AutomaticMemberService,
+    private readonly kafkaService: KafkaService,
+    private readonly cacheService: CacheService,
+    private readonly auditLoggerService: AuditLoggerService
+  ) { }
 
-  public async getCohortsDetails(userData, request: any, response: any) {
-    let apiId = "api.concept.getCohortDetails";
+  private emitAuditSafely(event: any): void {
     try {
-      if (userData.name === "user") {
-        let findCohortId = await this.findCohortName(userData?.id);
-        let result = {
-          cohortData: [],
-        };
-        for (let data of findCohortId) {
-          let cohortData = {
-            cohortId: data?.cohortId,
-            name: data.name,
-            parentId: data?.parentId,
-            customField: {},
-          };
-          const getDetails = await this.getCohortListDetails(data?.cohortId);
-          cohortData.customField = getDetails;
-          result.cohortData.push(cohortData);
-        }
-        return response
-          .status(HttpStatus.OK)
-          .send(APIResponse.success(apiId, result, "OK"));
-      } else {
-        let cohortName = await this.cohortRepository.findOne({
-          where: { cohortId: userData?.id },
-          select: ["name", "parentId"],
-        });
-        let cohortData = {
-          cohortId: userData?.id,
-          name: cohortName?.name,
-          parentId: cohortName?.parentId,
-          customField: {},
-        };
-        const getDetails = await this.getCohortListDetails(userData?.id);
-        cohortData.customField = getDetails;
-        return response
-          .status(HttpStatus.OK)
-          .send(APIResponse.success(apiId, cohortData, "OK"));
-      }
-    } catch (error) {
-      return response
-        .status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .send(
-          APIResponse.error(
-            apiId,
-            "Something went wrong",
-            `Failure Retrieving Cohort Member. Error is: ${error}`,
-            "INTERNAL_SERVER_ERROR"
-          )
-        );
+      this.auditLoggerService.emit(event);
+    } catch (err: any) {
+      LoggerUtil.error(`Audit emission failed: ${err?.message || err}`, "", "AuditLogger");
     }
   }
 
-  public async findCohortName(userId: any) {
-    let query = `SELECT c."name",c."cohortId",c."parentId"
-    FROM public."CohortMembers" AS cm
-    LEFT JOIN public."Cohort" AS c ON cm."cohortId" = c."cohortId"
-    WHERE cm."userId"=$1 AND c.status=true`;
-    let result = await this.cohortMembersRepository.query(query, [userId]);
-    // if(!result.length){
-    //   return null;
+  public async getCohortsDetails(requiredData, res) {
+    const apiId = APIID.COHORT_READ;
+
+    // const cohortAcademicYear: any[] =
+    //   await this.cohortMembersService.isCohortExistForYear(
+    //     requiredData.academicYearId,
+    //     requiredData.cohortId
+    //   );
+
+    // if (cohortAcademicYear.length !== 1) {
+    //   return APIResponse.error(
+    //     res,
+    //     apiId,
+    //     "BAD_REQUEST",
+    //     API_RESPONSES.COHORT_NOT_IN_ACADEMIC_YEAR,
+    //     HttpStatus.BAD_REQUEST
+    //   );
     // }
-    return result;
-  }
 
-  public async getCohortListDetails(userId) {
-    let query = `SELECT DISTINCT f."label", fv."value", f."type", f."fieldParams"
-    FROM public."CohortMembers" cm
-    LEFT JOIN (
-        SELECT DISTINCT ON (fv."fieldId", fv."itemId") fv.*
-        FROM public."FieldValues" fv
-    ) fv ON fv."itemId" = cm."cohortId"
-    INNER JOIN public."Fields" f ON fv."fieldId" = f."fieldId"
-    WHERE cm."cohortId" = $1;`;
-    let result = await this.cohortMembersRepository.query(query, [userId]);
-    return result;
-  }
-  public async createCohort(request: any, cohortCreateDto: CohortCreateDto) {
     try {
-      const cohortData: any = {};
-      cohortCreateDto.cohortId = uuidv4();
-      Object.keys(cohortCreateDto).forEach((e) => {
-        if (
-          cohortCreateDto[e] &&
-          cohortCreateDto[e] != "" &&
-          e != "fieldValues"
-        ) {
-          if (Array.isArray(cohortCreateDto[e])) {
-            cohortData[e] = JSON.stringify(cohortCreateDto[e]);
-          } else {
-            cohortData[e] = cohortCreateDto[e];
-          }
-        }
+      const cohorts = await this.cohortRepository.find({
+        where: {
+          cohortId: requiredData.cohortId,
+        },
       });
-      const response = await this.cohortRepository.save(cohortData);
-      let cohortId = response?.cohortId;
 
-      let field_value_array = cohortCreateDto.fieldValues.split("|");
-
-      if (field_value_array.length > 0) {
-        let field_values = [];
-        for (let i = 0; i < field_value_array.length; i++) {
-          let fieldValues = field_value_array[i].split(":");
-          let fieldValueDto: FieldValuesDto = {
-            value: fieldValues[1] ? fieldValues[1].trim() : "",
-            itemId: cohortId,
-            fieldId: fieldValues[0] ? fieldValues[0].trim() : "",
-            createdBy: cohortCreateDto?.createdBy,
-            updatedBy: cohortCreateDto?.updatedBy,
-            createdAt: new Date().toISOString(), // Provide appropriate values for createdAt and updatedAt
-            updatedAt: new Date().toISOString(),
-          };
-
-          await this.fieldsService.createFieldValues(request, fieldValueDto);
-        }
+      if (!cohorts.length) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.COHORT_NOT_FOUND,
+          HttpStatus.BAD_REQUEST
+        );
       }
 
-      return new SuccessResponse({
-        statusCode: HttpStatus.CREATED,
-        message: "Ok.",
-        data: response,
+      // Tenant is resolved from the fetched cohort row, not the request.
+      const tenantId = cohorts[0].tenantId;
+      if (requiredData.getChildData) {
+        const payload = await this.cacheService.getOrLoad({
+          namespace: `cohort:${tenantId}`,
+          key: `read:${requiredData.cohortId}:child:cf${requiredData.customField ? 1 : 0}`,
+          dependsOn: ["fieldsdef"],
+          ttlSeconds: COHORT_TTL_SECONDS,
+          loader: () => this.buildChildData(cohorts, requiredData),
+        });
+        return APIResponse.success(res, apiId, payload, HttpStatus.OK, API_RESPONSES.COHORT_HIERARCHY);
+      } else {
+        const payload = await this.cacheService.getOrLoad({
+          namespace: `cohort:${tenantId}`,
+          key: `read:${requiredData.cohortId}:nochild`,
+          dependsOn: ["fieldsdef"],
+          ttlSeconds: COHORT_TTL_SECONDS,
+          loader: () => this.buildCohortData(cohorts),
+        });
+        return APIResponse.success(res, apiId, payload, HttpStatus.OK, API_RESPONSES.COHORT_LIST);
+      }
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  // Pure data builder (was handleCohortDataResponse); the caller caches this
+  // and writes the response.
+  private async buildCohortData(cohorts) {
+    const result = { cohortData: [] };
+
+    for (const data of cohorts) {
+      const cohortData = {
+        cohortId: data.cohortId,
+        name: data.name,
+        parentId: data.parentId,
+        type: data.type,
+        customField: await this.fieldsService.getCustomFieldDetails(data.cohortId, 'Cohort'),
+      };
+      result.cohortData.push(cohortData);
+    }
+    LoggerUtil.log(
+      API_RESPONSES.COHORT_DATA_RESPONSE,
+    )
+    return result;
+  }
+
+  // Pure data builder (was handleChildDataResponse); the caller caches this
+  // and writes the response.
+  private async buildChildData(cohorts, requiredData) {
+    const resultDataList = [];
+
+    for (const cohort of cohorts) {
+      const resultData = {
+        cohortName: cohort.name,
+        cohortId: cohort.cohortId,
+        parentId: cohort.parentId,
+        type: cohort.type,
+        status: cohort?.status,
+        customField: requiredData.customField
+          ? await this.fieldsService.getCustomFieldDetails(cohort.cohortId, 'Cohort')
+          : undefined,
+        childData: await this.getCohortHierarchy(
+          cohort.cohortId,
+          requiredData.customField
+        ),
+      };
+      resultDataList.push(resultData);
+
+      LoggerUtil.log(
+        API_RESPONSES.CHILD_DATA,
+      )
+    }
+
+    return resultDataList;
+  }
+
+  public async getCohortDataWithCustomfield(
+    cohortId: string,
+    contextType?: string
+  ) {
+    const fieldValues = await this.fieldsService.getCustomFieldDetails(cohortId, 'Cohort');
+    return fieldValues;
+  }
+
+  public async findCohortName(userId: any, academicYearId?: string) {
+
+    const baseQuery = `
+                    SELECT 
+                      c."name", 
+                      c."cohortId", 
+                      c."parentId", 
+                      c."type", 
+                      cm."status" AS cohortmemberstatus, 
+                      c."status", 
+                      cm."cohortMembershipId"
+                  `;
+
+    const additionalFields = academicYearId
+      ? `, cay."cohortAcademicYearId", cay."academicYearId"`
+      : ``;
+
+    const joins = academicYearId
+      ? `
+      JOIN public."CohortAcademicYear" cay ON cm."cohortAcademicYearId" = cay."cohortAcademicYearId"
+      WHERE cm."userId" = $1 AND cay."academicYearId" = $2
+    `
+      : `
+      LEFT JOIN public."Cohort" AS c ON cm."cohortId" = c."cohortId"
+      WHERE cm."userId" = $1
+    `;
+
+    const query = `
+                  ${baseQuery}
+                  ${additionalFields}
+                  FROM public."CohortMembers" AS cm
+                  JOIN public."Cohort" AS c ON cm."cohortId" = c."cohortId"
+                  ${joins}
+                `;
+    const params = academicYearId ? [userId, academicYearId] : [userId];
+
+    const result = await this.cohortMembersRepository.query(query, params);
+
+    return result;
+  }
+
+  //   public async getCohortCustomFieldDetails(cohortId: string) {
+  //     let context = 'COHORT';
+  //     let fieldValue = await this.fieldsService.getFieldValuesData(cohortId, context, "COHORT", null, true, true);
+  //     let results = [];
+
+  //     for (let data of fieldValue) {
+  //         let result = {
+  //             name: '',
+  //             value: ''
+  //         };
+  //         result.name = data.name;
+  //         result.value = data.value;
+  //         results.push(result);
+  //     }
+  //     return results;
+  // }
+
+  // public async getCohortCustomFieldDetails(
+  //   cohortId: string,
+  //   fieldOption?: boolean
+  // ) {
+  //   const query = `
+  //   SELECT DISTINCT 
+  //     f."fieldId",
+  //     f."label", 
+  //     fv."value", 
+  //     f."type", 
+  //     f."fieldParams",
+  //     f."sourceDetails"
+  //   FROM public."Cohort" c
+  //   LEFT JOIN (
+  //     SELECT DISTINCT ON (fv."fieldId", fv."itemId") fv.*
+  //     FROM public."FieldValues" fv
+  //   ) fv ON fv."itemId" = c."cohortId"
+  //   INNER JOIN public."Fields" f ON fv."fieldId" = f."fieldId"
+  //   WHERE c."cohortId" = $1;
+  // `;
+  //   let result = await this.cohortMembersRepository.query(query, [cohortId]);
+  //   result = result.map(async (data) => {
+  //     const originalValue = data.value;
+  //     let processedValue = data.value;
+
+  //     if (data?.sourceDetails) {
+  //       if (data.sourceDetails.source === "fieldparams") {
+  //         data.fieldParams.options.forEach((option) => {
+  //           if (data.value === option.value) {
+  //             processedValue = option.label;
+  //           }
+  //         });
+  //       } else if (data.sourceDetails.source === "table") {
+  //         const labels = await this.fieldsService.findDynamicOptions(
+  //           data.sourceDetails.table,
+  //           `${data.sourceDetails.table}_id='${data.value}'`
+  //         );
+  //         if (labels && labels.length > 0) {
+  //           const nameKey = Object.keys(labels[0]).find(key => key.endsWith("name"));
+  //           if (nameKey) {
+  //             processedValue = labels[0][nameKey]?.toLowerCase();
+  //           }
+  //         }
+  //       }
+  //     }
+
+  //     delete data.fieldParams;
+  //     delete data.sourceDetails;
+
+  //     return {
+  //       ...data,
+  //       value: processedValue,
+  //       code: originalValue,
+  //     };
+  //   });
+
+  //   LoggerUtil.log(
+  //     API_RESPONSES.COHORT_FIELD_DETAILS,
+  //   )
+
+  //   result = await Promise.all(result);
+  //   return result;
+  // }
+
+  public async validateFieldValues(field_value_array: string[]) {
+    const encounteredKeys = [];
+    for (const fieldValue of field_value_array) {
+      const [fieldId] = fieldValue.split(":").map((value) => value.trim());
+      if (encounteredKeys.includes(fieldId)) {
+        return { valid: false, fieldId: fieldId };
+      }
+      encounteredKeys.push(fieldId);
+    }
+    return { valid: true, fieldId: "true" };
+  }
+
+  public async createCohort(cohortCreateDto: CohortCreateDto, res) {
+    const apiId = APIID.COHORT_CREATE;
+    try {
+      // Add validation for check both duplicate field ids exist or not
+      // and whatever user pass fieldIds is exist in field table or not
+
+      const academicYearId = cohortCreateDto.academicYearId;
+      const tenantId = cohortCreateDto.tenantId;
+      cohortCreateDto.name = cohortCreateDto?.name.toLowerCase()
+      // verify if the academic year id is valid
+      const academicYear =
+        await this.academicYearService.getActiveAcademicYear(
+          cohortCreateDto.academicYearId,
+          tenantId
+        );
+
+      if (!academicYear) {
+        return APIResponse.error(
+          res,
+          apiId,
+          HttpStatus.NOT_FOUND.toLocaleString(),
+          API_RESPONSES.ACADEMICYEAR_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      if (
+        cohortCreateDto.customFields &&
+        cohortCreateDto.customFields.length > 0
+      ) {
+        const validationResponse = await this.fieldsService.validateCustomField(
+          cohortCreateDto,
+          cohortCreateDto.type || "COHORT"
+        );
+
+        // Check the validation response
+        if (!validationResponse.isValid) {
+          return APIResponse.error(
+            res,
+            apiId,
+            validationResponse.error,
+            "Validation Error",
+            HttpStatus.BAD_REQUEST
+          );
+        }
+      }
+      cohortCreateDto.status = cohortCreateDto.status || "active";
+      cohortCreateDto.attendanceCaptureImage = false;
+
+      // Ensure metadata is a JSON string if provided
+      if (cohortCreateDto.metadata && typeof cohortCreateDto.metadata === 'object') {
+        cohortCreateDto.metadata = JSON.stringify(cohortCreateDto.metadata);
+      }
+
+      // const existData = await this.cohortRepository.find({
+      //   where: {
+      //     name: cohortCreateDto.name,
+      //     status: In(["active", "pending"]),
+      //     type: cohortCreateDto.type,
+      //     parentId: cohortCreateDto.parentId
+      //       ? cohortCreateDto.parentId
+      //       : IsNull(),
+      //   },
+      // });
+      // if (existData.length > 0) {
+      //   return APIResponse.error(
+      //     res,
+      //     apiId,
+      //     API_RESPONSES.COHORT_NAME_EXIST,
+      //     API_RESPONSES.COHORT_EXISTS,
+      //     HttpStatus.CONFLICT
+      //   );
+      // }
+      const response = await this.cohortRepository.save(cohortCreateDto);
+
+      const auditCtx = getAuditContext();
+      this.emitAuditSafely({
+        entityType: "COHORT",
+        entityId: response.cohortId,
+        eventAction: "CREATED",
+        ...auditCtx,
+        metadata: {
+          tenantId: response.tenantId || null,
+          academicYearId: response.academicYearId || null,
+          name: response.name,
+          type: response.type,
+          status: response.status
+        }
       });
-    } catch (e) {
-      return new ErrorResponseTypeOrm({
-        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-        errorMessage: e,
+
+      const createFailures = [];
+
+      //SAVE  in fieldValues table
+      if (
+        response &&
+        cohortCreateDto.customFields &&
+        cohortCreateDto.customFields.length > 0
+      ) {
+        const cohortId = response?.cohortId;
+
+        // Prepare additional data for FieldValues table
+        const additionalData = {
+          tenantId: tenantId || null,
+          contextType: cohortCreateDto.type || "COHORT",
+          createdBy: cohortCreateDto.createdBy || null,
+          updatedBy: null,
+        };
+
+        if (cohortCreateDto.customFields.length > 0) {
+          for (const fieldValues of cohortCreateDto.customFields) {
+            const fieldData = {
+              fieldId: fieldValues["fieldId"],
+              value: fieldValues["value"],
+            };
+
+            const resfields = await this.fieldsService.updateCustomFields(
+              cohortId,
+              fieldData,
+              cohortCreateDto.customFields[0].fieldId,
+              additionalData
+            );
+            if (resfields.correctValue) {
+              if (!response["customFieldsValue"])
+                response["customFieldsValue"] = [];
+              response["customFieldsValue"].push(resfields);
+            } else {
+              createFailures.push(
+                `${fieldData.fieldId}: ${resfields?.valueIssue} - ${resfields.fieldName}`
+              );
+            }
+          }
+        }
+      }
+      // add the year mapping entry in table with cohortId and academicYearId
+      await this.cohortAcademicYearService.insertCohortAcademicYear(
+        response.cohortId,
+        academicYearId,
+        cohortCreateDto.createdBy,
+        cohortCreateDto.updatedBy,
+        tenantId
+      );
+
+      // Create writes Cohort + FieldValues, so bump both.
+      await this.cacheService.invalidate([
+        `cohort:${tenantId}`,
+        `cfields:${response.cohortId}`,
+        "userfilter",
+      ]);
+
+      const resBody = new ReturnResponseBody({
+        ...response,
+        academicYearId: academicYearId,
       });
+      LoggerUtil.log(
+        API_RESPONSES.CREATE_COHORT,
+      )
+
+      // Send response to the client
+      const apiResponse = APIResponse.success(
+        res,
+        apiId,
+        resBody,
+        HttpStatus.CREATED,
+        API_RESPONSES.CREATE_COHORT
+      );
+
+      // Publish cohort created event to Kafka asynchronously - after response is sent to client
+      this.publishCohortEvent('created', response.cohortId, academicYearId, apiId)
+        .catch(error => LoggerUtil.error(
+          `Failed to publish cohort created event to Kafka`,
+          `Error: ${error.message}`,
+          apiId
+        ));
+
+      return apiResponse;
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  public async updateCohortStatuses(
+    request: any,
+    cohortIds: string[],
+    status: string,
+    updatedBy: string,
+    res
+  ) {
+    const apiId = APIID.COHORT_STATUS_UPDATE;
+    try {
+      const uniqueCohortIds = [...new Set(cohortIds)];
+
+      const existingCohortsCount = await this.cohortRepository.count({
+        where: { cohortId: In(uniqueCohortIds) },
+      });
+
+      if (existingCohortsCount !== uniqueCohortIds.length) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "One or more cohort IDs do not exist",
+          "Invalid cohortId",
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      const affectedCohorts = await this.cohortRepository.find({
+        where: { cohortId: In(uniqueCohortIds) },
+        select: ["tenantId"],
+      });
+
+      const result = await this.cohortRepository.update(
+        { cohortId: In(uniqueCohortIds) },
+        { status, updatedBy }
+      );
+
+      // Bulk status change → bump cohort:{t} for each affected tenant.
+      await this.cacheService.invalidate(
+        [...new Set(affectedCohorts.map((c) => c.tenantId).filter(Boolean))].map((t) => `cohort:${t}`)
+      );
+
+      // Audit Log
+      const auditCtx = getAuditContext();
+      this.emitAuditSafely({
+        entityType: "COHORT",
+        entityId: uniqueCohortIds.length === 1
+          ? uniqueCohortIds[0]
+          : "COHORT",
+        eventAction: "STATUS_UPDATED",
+        ...auditCtx,
+        metadata: { status, cohortIds: uniqueCohortIds }
+      });
+      LoggerUtil.log(`Cohort statuses updated: ${result.affected} rows`);
+      return APIResponse.success(
+        res,
+        apiId,
+        { affected: result.affected },
+        HttpStatus.OK,
+        "Cohort statuses updated successfully"
+      );
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      );
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        error.message || API_RESPONSES.SERVER_ERROR,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 
   public async updateCohort(
     cohortId: string,
-    request: any,
-    cohortUpdateDto: CohortCreateDto
+    cohortUpdateDto: CohortUpdateDto,
+    res
   ) {
+    const apiId = APIID.COHORT_UPDATE;
+    // Define valid status transitions
+    const validTransitions = {
+      archived: ["active", "inactive"],
+      active: ["archived", "inactive"],
+      inactive: ["active", "archived"],
+    };
     try {
-      const cohortUpdateData: any = {};
-
-      Object.keys(cohortUpdateDto).forEach((e) => {
-        if (
-          cohortUpdateDto[e] &&
-          cohortUpdateDto[e] != "" &&
-          e != "fieldValues"
-        ) {
-          if (Array.isArray(cohortUpdateDto[e])) {
-            cohortUpdateData[e] = JSON.stringify(cohortUpdateDto[e]);
-          } else {
-            cohortUpdateData[e] = cohortUpdateDto[e];
-          }
-        }
-      });
-
-      const response = await this.cohortRepository.update(
-        cohortId,
-        cohortUpdateData
-      );
-
-      let field_value_array = cohortUpdateDto.fieldValues.split("|");
-
-      if (field_value_array.length > 0) {
-        let field_values = [];
-        for (let i = 0; i < field_value_array.length; i++) {
-          let fieldValues = field_value_array[i].split(":");
-          let fieldId = fieldValues[0] ? fieldValues[0].trim() : "";
-          try {
-            const fieldVauesRowId = await this.fieldsService.searchFieldValueId(
-              cohortId,
-              fieldId
-            );
-            const rowid = fieldVauesRowId.fieldValuesId;
-
-            let fieldValueDto: FieldValuesDto = {
-              value: fieldValues[1] ? fieldValues[1].trim() : "",
-              itemId: cohortId,
-              fieldId: fieldValues[0] ? fieldValues[0].trim() : "",
-              createdBy: cohortUpdateDto?.createdBy,
-              updatedBy: cohortUpdateDto?.updatedBy,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            };
-            await this.fieldsService.updateFieldValues(rowid, fieldValueDto);
-          } catch {
-            // let fieldValueDto: FieldValuesDto = {
-            //   fieldValuesId: null,
-            //   value: fieldValues[1] ? fieldValues[1].trim() : "",
-            //   itemId: cohortId,
-            //   fieldId: fieldValues[0] ? fieldValues[0].trim() : "",
-            //   createdBy: cohortUpdateDto?.createdBy,
-            //   updatedBy: cohortUpdateDto?.updatedBy,
-            //   createdAt: new Date().toISOString(),
-            //   updatedAt: new Date().toISOString(),
-            // };
-            // await this.fieldsService.createFieldValues(request, fieldValueDto);
-          }
-        }
+      if (!isUUID(cohortId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          `Please Enter valid cohortId(UUID)`,
+          `Invalid cohortId`,
+          HttpStatus.CONFLICT
+        );
       }
 
-      return new SuccessResponse({
-        statusCode: HttpStatus.OK,
-        message: "Ok.",
-        data: {
-          rowCount: response.affected,
-        },
+      // const checkData = await this.checkIfCohortExist(cohortId);
+      const existingCohorDetails = await this.cohortRepository.findOne({
+        where: { cohortId: cohortId },
       });
-    } catch (e) {
-      return new ErrorResponseTypeOrm({
-        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-        errorMessage: e,
-      });
+
+      if (existingCohorDetails) {
+        const updateData = {};
+        const customFields = {};
+
+        //validation  of customFields correct or not
+        if (
+          cohortUpdateDto.customFields &&
+          cohortUpdateDto.customFields.length > 0
+        ) {
+          const contextType =
+            cohortUpdateDto?.type || existingCohorDetails?.type;
+          const validationResponse =
+            await this.fieldsService.validateCustomField(
+              cohortUpdateDto,
+              contextType
+            );
+          if (!validationResponse.isValid) {
+            return APIResponse.error(
+              res,
+              apiId,
+              validationResponse.error,
+              "Validation Error",
+              HttpStatus.BAD_REQUEST
+            );
+          }
+        }
+
+        // validation for name or parent alredy exist or not
+        if (cohortUpdateDto.name || cohortUpdateDto.parentId) {
+          const filterOptions = {
+            where: {
+              name: cohortUpdateDto.name || existingCohorDetails.name,
+              parentId: cohortUpdateDto.parentId || existingCohorDetails.parentId,
+              cohortId: Not(cohortId),
+            },
+          };
+          const existData = await this.cohortRepository.find(filterOptions);
+
+          if (existData.length > 0) {
+            return APIResponse.error(
+              res,
+              apiId,
+              `Cohort name already exists under the specified parent. Please provide another name or parent.`,
+              `Cohort already exists`,
+              HttpStatus.CONFLICT
+            );
+          }
+        }
+
+        // Iterate over all keys in cohortUpdateDto
+        for (const key in cohortUpdateDto) {
+          if (
+            cohortUpdateDto.hasOwnProperty(key) &&
+            cohortUpdateDto[key] !== null
+          ) {
+            if (key !== "customFields") {
+              updateData[key] = cohortUpdateDto[key];
+            } else {
+              customFields[key] = cohortUpdateDto[key];
+            }
+          }
+        }
+
+        let response;
+        // save cohort detail in cohort table
+        if (Object.keys(updateData).length > 0) {
+          response = await this.cohortRepository.update(cohortId, updateData);
+        }
+
+        //SAVE customFields  in fieldValues table
+        if (
+          cohortUpdateDto.customFields &&
+          cohortUpdateDto.customFields.length > 0
+        ) {
+          const contextType = cohortUpdateDto.type
+            ? [cohortUpdateDto.type]
+            : existingCohorDetails?.type
+              ? [existingCohorDetails.type]
+              : [];
+          const allCustomFields = await this.fieldsService.findCustomFields(
+            "COHORT",
+            contextType
+          );
+
+
+          if (allCustomFields.length > 0) {
+            const customFieldAttributes = allCustomFields.reduce(
+              (fieldDetail, { fieldId, fieldAttributes, fieldParams, name }) =>
+                fieldDetail[`${fieldId}`]
+                  ? fieldDetail
+                  : {
+                    ...fieldDetail,
+                    [`${fieldId}`]: { fieldAttributes, fieldParams, name },
+                  },
+              {}
+            );
+            for (const fieldValues of cohortUpdateDto.customFields) {
+              const fieldData = {
+                fieldId: fieldValues["fieldId"],
+                value: fieldValues["value"],
+              };
+              const additionalData ={
+                tenantId: existingCohorDetails.tenantId,
+                contextType: existingCohorDetails.type,
+                createdBy: existingCohorDetails.createdBy,
+                updatedBy: existingCohorDetails.updatedBy,
+              }
+              await this.fieldsService.updateCustomFields(
+                cohortId,
+                fieldData,
+                customFieldAttributes[fieldData.fieldId],
+                additionalData
+              );
+            }
+          }
+        }
+
+        //Update status in cohortMember table if exist record corresponding cohortId
+        let updatedCohortMembers: CohortMembers[] = [];
+        if (
+          validTransitions[cohortUpdateDto.status]?.includes(
+            existingCohorDetails.status
+          )
+        ) {
+          let memberStatus;
+          if (cohortUpdateDto.status === "archived") {
+            memberStatus = MemberStatus.ARCHIVED;
+          } else if (cohortUpdateDto.status === "active") {
+            memberStatus = MemberStatus.ACTIVE;
+          } else if (cohortUpdateDto.status === "inactive") {
+            memberStatus = MemberStatus.INACTIVE;
+          }
+
+          if (memberStatus) {
+            const cohortMembers = await this.cohortMembersRepository.find({
+              where: {
+                cohortId,
+                status: MemberStatus.ACTIVE,
+              },
+            });
+
+            if (cohortMembers.length > 0) {
+              await this.cohortMembersRepository.update(
+                { cohortId , status: MemberStatus.ACTIVE },
+                { status: memberStatus, updatedBy: cohortUpdateDto.updatedBy }
+              );
+
+              for (const cohortMember of cohortMembers) {
+                cohortMember.status = memberStatus;
+                cohortMember.updatedBy = cohortUpdateDto.updatedBy;
+                updatedCohortMembers.push(cohortMember);
+              }
+            }
+          }
+        }
+
+        // Update writes Cohort + FieldValues, so bump both.
+        await this.cacheService.invalidate([
+          `cohort:${existingCohorDetails.tenantId}`,
+          `cfields:${cohortId}`,
+          "userfilter",
+        ]);
+        const auditCtx = getAuditContext();
+        this.emitAuditSafely({
+          entityType: "COHORT",
+          entityId: cohortId,
+          eventAction: "UPDATED",
+          ...auditCtx,
+          metadata: {
+            updatedFields: cohortUpdateDto, // Capturing the update payload for BRD compliance
+            cohortId: cohortId
+          }
+        });
+
+        LoggerUtil.log(
+          API_RESPONSES.COHORT_UPDATED_SUCCESSFULLY,
+        )
+
+        // Send response to the client
+        const apiResponse = APIResponse.success(
+          res,
+          apiId,
+          response?.affected,
+          HttpStatus.OK,
+          API_RESPONSES.COHORT_UPDATED_SUCCESSFULLY
+        );
+
+        // Publish cohort updated event to Kafka asynchronously - after response is sent to client
+        this.publishCohortEvent('updated', cohortId, null, apiId)
+          .catch(error => LoggerUtil.error(
+            `Failed to publish cohort updated event to Kafka`,
+            `Error: ${error.message}`,
+            apiId
+          ));
+
+        // Publish cohort member updated events to Kafka asynchronously - after response is sent to client
+        if (updatedCohortMembers.length > 0) {
+          Promise.all(
+            updatedCohortMembers.map((cohortMember) =>
+              this.cohortMembersService.publishCohortMemberEvent(
+                'updated',
+                cohortMember,
+                apiId
+              )
+            )
+          ).catch(error => LoggerUtil.error(
+            'Failed to publish cohort member updated events to Kafka',
+            'Error: ' + error.message,
+            apiId
+          ));
+        }
+
+        return apiResponse;
+      } else {
+        return APIResponse.error(
+          res,
+          apiId,
+          `Cohort not found`,
+          `Cohort not found`,
+          HttpStatus.NOT_FOUND
+        );
+      }
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 
+  // The loader computes the success payload; validation failures respond
+  // inside it and yield null, which is never cached.
   public async searchCohort(
     tenantId: string,
-    request: any,
-    cohortSearchDto: CohortSearchDto
+    academicYearId: string,
+    cohortSearchDto: CohortSearchDto,
+    response
   ) {
-    try {
-      let { limit, page, filters } = cohortSearchDto;
+    // A free-text `filters.name` (cohort-name search) is high-cardinality and
+    // rarely repeats — caching it would fill the store with near-unique keys
+    // that almost never hit. So a name search bypasses the cache and runs the
+    // live query; all other searches stay cached under cohort:{tenantId}.
+    const useCache = !cohortSearchDto?.filters?.name;
+    const runQuery = async () => {
+      const result = await this.searchCohortData(tenantId, academicYearId, cohortSearchDto, response);
+      return response.headersSent ? null : result;
+    };
+    const payload = useCache
+      ? await this.cacheService.getOrLoad({
+          namespace: `cohort:${tenantId}`,
+          key: `search:${hashCacheKey({ academicYearId, cohortSearchDto })}`,
+          dependsOn: ["fieldsdef"],
+          ttlSeconds: COHORT_TTL_SECONDS,
+          loader: runQuery,
+        })
+      : await runQuery();
+    if (payload === null || payload === undefined) {
+      return; // an error response was already written inside the loader
+    }
+    return APIResponse.success(
+      response,
+      APIID.COHORT_LIST,
+      payload,
+      HttpStatus.OK,
+      "Cohort details fetched successfully"
+    );
+  }
 
-      let offset = 0;
-      if (page > 1) {
-        offset = limit * (page - 1);
+  private async searchCohortData(
+    tenantId: string,
+    academicYearId: string,
+    cohortSearchDto: CohortSearchDto,
+    response
+  ) {
+    const apiId = APIID.COHORT_LIST;
+    try {
+      const { sort, filters } = cohortSearchDto;
+      let { limit, offset } = cohortSearchDto;
+      let cohortsByAcademicYear: CohortAcademicYear[];
+
+      offset = offset || 0;
+      limit = limit || 200;
+
+      const emptyValueKeys = {};
+      let emptyKeysString = "";
+
+      const MAX_LIMIT = 200;
+
+      // Validate the limit parameter
+      if (limit > MAX_LIMIT) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Limit exceeds maximum allowed value of ${MAX_LIMIT}`,
+          `Limit exceeded`,
+          HttpStatus.BAD_REQUEST
+        );
       }
 
+      //Get all cohorts fields
+      const cohortAllKeys = this.cohortRepository.metadata.columns.map(
+        (column) => column.propertyName
+      );
+
+      //Get custom fields
+      const getCustomFields = await this.fieldsRepository.find({
+        where: [
+          { context: In(["COHORT", null, "null", "NULL"]), contextType: null },
+          { context: IsNull(), contextType: IsNull() },
+        ],
+        select: ["fieldId", "name", "label", "contextType"],
+      });
+      // Extract custom field names
+      const customFieldsKeys = getCustomFields.map(
+        (customFields) => customFields.name
+      );
+
+      // Combine the arrays
+      const allowedKeys = ["userId", ...cohortAllKeys, ...customFieldsKeys];
 
       const whereClause = {};
+      const searchCustomFields = {};
+
+      // SECURITY FIX: Always enforce tenantId from headers, not from filters
+      // This prevents users from querying cohorts from other tenants
+      whereClause["tenantId"] = tenantId;
+
+      if (academicYearId) {
+        // check if the tenantId and academic year exist together
+        cohortsByAcademicYear =
+          await this.cohortAcademicYearService.getCohortsAcademicYear(
+            academicYearId,
+            tenantId
+          );
+
+        if (cohortsByAcademicYear?.length === 0) {
+          return APIResponse.error(
+            response,
+            apiId,
+            API_RESPONSES.COHORT_NOT_AVAILABLE_FOR_ACADEMIC_YEAR,
+            API_RESPONSES.COHORT_NOT_AVAILABLE_FOR_ACADEMIC_YEAR,
+            HttpStatus.NOT_FOUND
+          );
+        }
+      }
       if (filters && Object.keys(filters).length > 0) {
-        Object.entries(filters).forEach(([key, value]) => {
-          whereClause[key] = value;
+        // Clean up filters: remove undefined, null properties before processing
+        const cleanedFilters = Object.fromEntries(
+          Object.entries(filters).filter(([_, value]) => value !== undefined && value !== null)
+        );
+
+        if (cleanedFilters?.customFieldsName) {
+          Object.entries(cleanedFilters.customFieldsName).forEach(([key, value]) => {
+            if (customFieldsKeys.includes(key)) {
+              searchCustomFields[key] = value;
+            }
+          });
+        }
+
+        Object.entries(cleanedFilters).forEach(([key, value]) => {
+          // SECURITY FIX: Skip tenantId from filters - always use the one from headers
+          if (key === "tenantId") {
+            return; // Ignore tenantId from request body filters
+          }
+
+          if (!allowedKeys.includes(key) && key !== "customFieldsName") {
+            return APIResponse.error(
+              response,
+              apiId,
+              `${key} Invalid key`,
+              `Invalid filter key`,
+              HttpStatus.BAD_REQUEST
+            );
+          }
+          if (value === "") {
+            emptyValueKeys[key] = value;
+            emptyKeysString += (emptyKeysString ? ", " : "") + key;
+          } else if (key === "name") {
+            whereClause[key] = ILike(`%${value}%`);
+          } else if (cohortAllKeys.includes(key)) {
+            whereClause[key] = value;
+          } else if (customFieldsKeys.includes(key)) {
+            searchCustomFields[key] = value;
+          }
         });
       }
-      const [results, totalCount] = await this.cohortRepository.findAndCount({
-        where: whereClause,
-        skip: offset,
-        take: limit,
-      });
 
-      const mappedResponse = await this.mappedResponse(results);
+      if (whereClause["parentId"]) {
+        whereClause["parentId"] = In(whereClause["parentId"]);
+      }
+      if (whereClause["status"]) {
+        whereClause["status"] = In(whereClause["status"]);
+      }
+      if (whereClause["cohortId"]) {
+        whereClause["cohortId"] = In(whereClause["cohortId"]);
+      }
 
-      return new SuccessResponse({
-        statusCode: HttpStatus.OK,
-        message: "Ok.",
-        totalCount,
-        data: mappedResponse,
-      });
-    } catch (e) {
-      return new ErrorResponseTypeOrm({
-        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-        errorMessage: e,
-      });
+      const results = {
+        cohortDetails: [],
+      };
+
+      const order = {};
+      if (sort?.length) {
+        order[sort[0]] = ["ASC", "DESC"].includes(sort[1].toUpperCase())
+          ? sort[1].toUpperCase()
+          : "ASC";
+      } else {
+        order["name"] = "ASC";
+      }
+
+      let count = 0;
+
+      if (whereClause["userId"]) {
+        const additionalFields = Object.keys(whereClause).filter(
+          (key) => key !== "userId" && key !== "academicYearId"
+        );
+        if (additionalFields.length > 0) {
+          // Handle the case where userId is provided along with other fields
+          return APIResponse.error(
+            response,
+            apiId,
+            `When filtering by userId, do not include additional fields`,
+            "Invalid filters",
+            HttpStatus.BAD_REQUEST
+          );
+        }
+
+        const userTenantMapExist = await this.UserTenantMappingRepository.find({
+          where: {
+            tenantId: tenantId,
+            userId: whereClause["userId"],
+          },
+        });
+        if (userTenantMapExist.length == 0) {
+          return APIResponse.error(
+            response,
+            apiId,
+            `User is not mapped for this tenant`,
+            "Invalid combination of userId and tenantId",
+            HttpStatus.BAD_REQUEST
+          );
+        }
+
+        const [data, totalCount] =
+          await this.cohortMembersRepository.findAndCount({
+            where: whereClause,
+          });
+        const userExistCohortGroup = data.slice(offset, offset + limit);
+        count = totalCount;
+
+        const cohortIds = userExistCohortGroup.map(
+          (cohortId) => cohortId.cohortId
+        );
+
+        const cohortAllData = await this.cohortRepository.find({
+          where: {
+            cohortId: In(cohortIds),
+          },
+          order,
+        });
+        for (const data of cohortAllData) {
+          const customFieldsData = await this.getCohortDataWithCustomfield(
+            data.cohortId
+          );
+          data["customFields"] = customFieldsData;
+          results.cohortDetails.push(data);
+        }
+      } else {
+        let getCohortIdUsingCustomFields;
+
+        //If source config in source details from fields table is not exist then return false
+
+        if (Object.keys(searchCustomFields).length > 0) {
+          const context = "COHORT";
+          getCohortIdUsingCustomFields =
+            await this.fieldsService.filterUserUsingCustomFieldsOptimized(
+              context,
+              searchCustomFields
+            );
+
+          if (getCohortIdUsingCustomFields == null) {
+            return APIResponse.error(
+              response,
+              apiId,
+              "No data found",
+              "NOT FOUND",
+              HttpStatus.NOT_FOUND
+            );
+          }
+        }
+
+        if (
+          getCohortIdUsingCustomFields &&
+          getCohortIdUsingCustomFields.length > 0 && !whereClause['cohortId']
+        ) {
+          let cohortIdsByFieldAndAcademicYear;
+          if (cohortsByAcademicYear?.length >= 1) {
+            cohortIdsByFieldAndAcademicYear = cohortsByAcademicYear.filter(
+              ({ cohortId }) => getCohortIdUsingCustomFields.includes(cohortId)
+            );
+          }
+          const cohortIds = cohortIdsByFieldAndAcademicYear?.map(
+            ({ cohortId }) => cohortId
+          );
+          whereClause["cohortId"] = In(cohortIds);
+        }
+        // } else if (cohortsByAcademicYear?.length >= 1) {
+        //   const cohortIds = cohortsByAcademicYear?.map(
+        //     ({ cohortId }) => cohortId
+        //   );
+        //   whereClause["cohortId"] = In(cohortIds);
+        // }
+
+        const [data, totalCount] = await this.cohortRepository.findAndCount({
+          where: whereClause,
+          order,
+        });
+
+
+        const cohortData = data.slice(offset, offset + limit);
+        count = totalCount;
+
+        for (const data of cohortData) {
+          const customFieldsData = await this.getCohortDataWithCustomfield(
+            data.cohortId,
+            data.type
+          );
+          data["customFields"] = customFieldsData || [];
+          results.cohortDetails.push(data);
+        }
+      }
+      if (results.cohortDetails.length > 0) {
+        // Return the raw payload so the caching wrapper can store it; the
+        // outer searchCohort() writes the success response. Error branches
+        // still write directly (response.headersSent tells the wrapper).
+        return { count, results };
+      } else {
+        return APIResponse.error(
+          response,
+          apiId,
+          `No data found.`,
+          "No data found.",
+          HttpStatus.NOT_FOUND
+        );
+      }
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        response,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 
-  public async mappedResponse(result: any) {
-    const cohortValueResponse = result.map((item: any) => {
-      const cohortMapping = {
-        tenantId: item?.tenantId ? `${item.tenantId}` : "",
-        programId: item?.programId ? `${item.programId}` : "",
-        cohortId: item?.cohortId ? `${item.cohortId}` : "",
-        parentId: item?.parentId ? `${item.parentId}` : "",
-        name: item?.name ? `${item.name}` : "",
-        type: item?.type ? `${item.type}` : "",
-        status: item?.status ? `${item.status}` : "",
-        image: item?.image ? `${item.image}` : "",
-        createdAt: item?.createdAt ? `${item.createdAt}` : "",
-        updatedAt: item?.updatedAt ? `${item.updatedAt}` : "",
-        createdBy: item?.createdBy ? `${item.createdBy}` : "",
-        updatedBy: item?.updatedBy ? `${item.updatedBy}` : "",
-        referenceId: item?.referenceId ? `${item.referenceId}` : "",
-        metadata: item?.metadata ? `${item.metadata}` : "",
-      };
-      return new CohortDto(cohortMapping);
-    });
-    return cohortValueResponse;
+  public async updateCohortStatus(cohortId: string, response, userId: string) {
+    const apiId = APIID.COHORT_DELETE;
+    try {
+      if (!isUUID(cohortId)) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Invalid Cohort Id format. It must be a valid UUID`,
+          "Invalid cohortId",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      const checkData = await this.checkIfCohortExist(cohortId);
+
+      if (checkData === true) {
+        // Tenant read before the deletes so the invalidation below can key by it.
+        const cohortRow = await this.cohortRepository.findOne({ where: { cohortId } });
+        const cohortTenantId = cohortRow?.tenantId;
+
+        const query = `UPDATE public."Cohort"
+        SET "status" = 'archived',
+        "updatedBy" = '${userId}'
+        WHERE "cohortId" = $1`;
+        const affectedrows = await this.cohortRepository.query(query, [
+          cohortId,
+        ]);
+        await this.cohortMembersRepository.delete({ cohortId: cohortId });
+        await this.fieldValuesRepository.delete({ itemId: cohortId });
+
+        // Delete archives the Cohort and removes its members + FieldValues.
+        await this.cacheService.invalidate([
+          ...(cohortTenantId ? [`cohort:${cohortTenantId}`, `cohortmember:${cohortTenantId}`] : []),
+          `cfields:${cohortId}`,
+          "userfilter",
+        ]);
+
+        // Send response to the client
+        const apiResponse = APIResponse.success(
+          response,
+          apiId,
+          affectedrows[1],
+          HttpStatus.OK,
+          "Cohort Deleted Successfully."
+        );
+
+        // Audit Log
+        const auditCtx = getAuditContext();
+        this.emitAuditSafely({
+          entityType: "COHORT",
+          entityId: cohortId,
+          eventAction: "DELETED",
+          ...auditCtx,
+        });
+
+        // Publish cohort deleted event to Kafka asynchronously - after response is sent to client
+        this.publishCohortEvent('deleted', cohortId, null, apiId)
+          .catch(error => LoggerUtil.error(
+            `Failed to publish cohort deleted event to Kafka`,
+            `Error: ${error.message}`,
+            apiId
+          ));
+
+        return apiResponse;
+      } else {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Cohort not found`,
+          "Invalid cohortId",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        response,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
   }
 
-  public async updateCohortStatus(cohortId: string) {
+  public async checkIfCohortExist(id: any) {
+    const existData = await this.cohortRepository.find({
+      where: {
+        cohortId: id,
+      },
+    });
+    if (existData.length !== 0) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  private async getCohortHierarchy(
+    parentId: string,
+    customField?: boolean
+  ): Promise<any> {
+    const childData = await this.cohortRepository.find({ where: { parentId } });
+    const hierarchy = [];
+    let customFieldDetails;
+    let childHierarchy;
+    for (const data of childData) {
+      if (customField) {
+        childHierarchy = await this.getCohortHierarchy(
+          data.cohortId,
+          customField
+        );
+        customFieldDetails = await this.fieldsService.getCustomFieldDetails(
+          data.cohortId, 'Cohort'
+        );
+      } else {
+        childHierarchy = await this.getCohortHierarchy(data.cohortId);
+      }
+      hierarchy.push({
+        cohortId: data.cohortId,
+        name: data.name,
+        parentId: data.parentId,
+        type: data.type,
+        status: data.status,
+        customField: customFieldDetails || [],
+        childData: childHierarchy,
+      });
+    }
+
+    LoggerUtil.log(
+      API_RESPONSES.COHORT_HIERARCHY,
+    )
+
+    return hierarchy;
+  }
+
+  public async getCohortDetailsByIds(ids: string[], academicYearId) {
+    return await this.cohortRepository
+      .createQueryBuilder('cohort')
+      .innerJoin('CohortAcademicYear', 'cay', 'cohort.cohortId = cay.cohortId')
+      .where('cohort.cohortId IN (:...ids)', { ids })
+      .andWhere('cay.academicYearId = :academicYearId', { academicYearId })
+      .select(['cohort.cohortId', 'cohort.name', 'cohort.parentId', 'cohort.type', 'cohort.status'])
+      .getMany();
+  }
+
+  public async automaticMemberCohortHierarchy(requiredData, academicYearId) {
+    const { condition: { value, fieldId } } = requiredData?.rules;
+
+    // Pass fieldId to getSearchFieldValueData
+    let filledValues = await this.fieldsService.getSearchFieldValueData(
+      0,
+      0,
+      {
+        fieldId: fieldId,
+        value: value
+      }  // Passing extracted fieldId
+    );
+    const cohortIds = filledValues.mappedResponse.map(item => item.itemId);
+
+    if (cohortIds.length === 0) {
+      throw new Error("No cohort IDs found for the given fieldId and value.");
+    }
+
+    const existingCohortIds = await this.getCohortDetailsByIds(cohortIds, academicYearId);
+    return existingCohortIds;
+  }
+
+  public async getCohortHierarchyData(requiredData, res) {
+    const apiId = APIID.COHORT_LIST;
+
     try {
-      let query = `UPDATE public."Cohort"
-      SET "status" = false
-      WHERE "cohortId" = $1`;
-      const results = await this.cohortRepository.query(query, [cohortId]);
-      return new SuccessResponse({
-        statusCode: HttpStatus.OK,
-        message: "Cohort Deleted Successfully.",
+      // dependsOn is cohortmember:{t} — NOT cohort:{t} — deliberately: a
+      // membership change must refresh this read without a cohort:{t} bump.
+      // When tenantId isn't supplied, fall through uncached.
+      if (requiredData.tenantId) {
+        const payload = await this.cacheService.getOrLoad({
+          namespace: `cohort:${requiredData.tenantId}`,
+          key: `mycohorts:${requiredData.userId}:child${requiredData.getChildData ? 1 : 0}:cf${requiredData.customField ? 1 : 0}`,
+          dependsOn: [`cohortmember:${requiredData.tenantId}`, "fieldsdef"],
+          ttlSeconds: COHORT_TTL_SECONDS,
+          loader: () => this.buildMyCohortsData(requiredData),
+        });
+        if (payload === null || payload === undefined) {
+          return APIResponse.error(res, apiId, "BAD_REQUEST", `No Cohort Found for this User ID`, HttpStatus.BAD_REQUEST);
+        }
+        return APIResponse.success(res, apiId, payload, HttpStatus.OK, API_RESPONSES.COHORT_HIERARCHY);
+      }
+
+      const resultDataList = await this.buildMyCohortsData(requiredData);
+      if (resultDataList === null) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "BAD_REQUEST",
+          `No Cohort Found for this User ID`,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      return APIResponse.success(
+        res,
+        apiId,
+        resultDataList,
+        HttpStatus.OK,
+        API_RESPONSES.COHORT_HIERARCHY
+      );
+
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      );
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  // Pure data builder for mycohorts; returns null when the user has no cohort
+  // (the caller turns that into a 400). The automatic-member branch is
+  // preserved from the original getCohortHierarchyData.
+  private async buildMyCohortsData(requiredData) {
+    const checkAutomaticMember = await this.automaticMemberService.checkMemberById(requiredData.userId);
+    let findCohortId;
+    if (checkAutomaticMember) {
+      findCohortId = await this.automaticMemberCohortHierarchy(checkAutomaticMember, requiredData?.academicYearId);
+    } else {
+      findCohortId = await this.findCohortName(requiredData.userId, requiredData?.academicYearId);
+      if (!findCohortId.length) {
+        return null;
+      }
+    }
+
+    const resultDataList = [];
+    for (const cohort of findCohortId) {
+      resultDataList.push({
+        cohortName: cohort?.name,
+        cohortId: cohort?.cohortId,
+        parentId: cohort?.parentId,
+        cohortMemberStatus: cohort?.cohortmemberstatus,
+        cohortMembershipId: cohort?.cohortMembershipId,
+        cohortStatus: cohort?.cohortstatus || cohort?.status,
+        type: cohort?.type,
+        customField: await this.fieldsService.getCustomFieldDetails(cohort.cohortId, 'Cohort'),
+        childData: requiredData.getChildData
+          ? await this.getCohortHierarchy(cohort.cohortId, requiredData.customField)
+          : []
       });
-    } catch (e) {
-      return new ErrorResponseTypeOrm({
-        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-        errorMessage: e,
+    }
+    return resultDataList;
+  }
+
+  /**
+   * Publish cohort events to Kafka
+   * @param eventType Type of event (created, updated, deleted)
+   * @param cohortId Cohort ID for whom the event is published
+   * @param apiId API ID for logging
+   */
+  private async publishCohortEvent(
+    eventType: 'created' | 'updated' | 'deleted',
+    cohortId: string,
+    academicYearId: string | null,
+    apiId: string
+  ): Promise<void> {
+    try {
+      // For delete events, we may want to include just basic information since the cohort might already be removed
+      let cohortData: any;
+
+      if (eventType === 'deleted') {
+        cohortData = {
+          cohortId: cohortId,
+          deletedAt: new Date().toISOString()
+        };
+      } else {
+        // For create and update, fetch complete data from DB
+        try {
+          // Get basic cohort information
+          const cohort = await this.cohortRepository.findOne({
+            where: { cohortId: cohortId },
+            select: [
+              "cohortId",
+              "name",
+              "type",
+              "status",
+              "parentId",
+              "tenantId",
+              "createdAt",
+              "updatedAt",
+              "createdBy",
+              "updatedBy"
+            ]
+          });
+
+          if (!cohort) {
+            LoggerUtil.error(`Failed to fetch cohort data for Kafka event`, `Cohort with ID ${cohortId} not found`);
+            cohortData = { cohortId };
+          } else {
+            // Get custom fields for the cohort
+            let customFields = [];
+            try {
+              customFields = await this.fieldsService.getCustomFieldDetails(cohortId, 'Cohort');
+            } catch (customFieldError) {
+              LoggerUtil.error(
+                `Failed to fetch custom fields for Kafka event`,
+                `Error: ${customFieldError.message}`,
+                apiId
+              );
+              // Don't fail the entire operation if custom fields fetching fails
+              customFields = [];
+            }
+
+            // Build the cohort data object
+            cohortData = {
+              ...cohort,
+              ...(academicYearId && { academicYearId }),
+              customFields: customFields || [],
+              eventTimestamp: new Date().toISOString()
+            };
+          }
+        } catch (error) {
+          LoggerUtil.error(
+            `Failed to fetch cohort data for Kafka event`,
+            `Error: ${error.message}`
+          );
+          // Return at least the cohortId if we can't fetch complete data
+          cohortData = { cohortId };
+        }
+      }
+
+      await this.kafkaService.publishCohortEvent(eventType, cohortData, cohortId);
+      LoggerUtil.log(`Cohort ${eventType} event published to Kafka for cohort ${cohortId}`, apiId);
+    } catch (error) {
+      LoggerUtil.error(
+        `Failed to publish cohort ${eventType} event to Kafka`,
+        `Error: ${error.message}`,
+        apiId
+      );
+      // Don't throw the error to avoid affecting the main operation
+    }
+  }
+
+  /**
+   * Get reverse geographical hierarchy for a user based on their cohort assignments
+   * @param requiredData - Object containing userId and academicYearId
+   * @param res - Response object
+   * @returns APIResponse with geographical hierarchy: State -> District -> Block -> Center -> Batch
+   */
+  public async getUserGeographicalHierarchy(
+    requiredData,
+    res
+  ) {
+    const apiId = APIID.COHORT_READ;
+
+    try {
+      const { userId, academicYearId, filters, limit, offset } = requiredData;
+
+      // Validate userId
+      if (!userId || !isUUID(userId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.INVALID_USERID,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      const paginationLimit = limit || 100;
+      const paginationOffset = offset || 0;
+
+      LoggerUtil.log(
+        `Getting geographical hierarchy for userId: ${userId}, academicYearId: ${academicYearId}`,
+        apiId
+      );
+
+      // Step 1: Get user cohorts (batches and centers)
+      let userCohorts = await this.findCohortName(userId, academicYearId);
+      if (!userCohorts || userCohorts.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      // Step 1.2: Keep only active memberships so the same batch does not appear multiple times (reassigned rows excluded)
+      const memberStatus = (c: any) => (c.cohortmemberstatus || c.cohortMemberStatus || "").toString().toLowerCase();
+      userCohorts = userCohorts.filter((c) => memberStatus(c) === "active");
+
+      // Step 1.5: Apply filters to user cohorts if provided
+      if (filters && Object.keys(filters).length > 0) {
+        const cleanedFilters = Object.fromEntries(
+          Object.entries(filters).filter(([_, value]) => value !== undefined && value !== null)
+        ) as Record<string, any>;
+
+        // Filter by parentId
+        if (cleanedFilters.parentId && Array.isArray(cleanedFilters.parentId) && cleanedFilters.parentId.length > 0) {
+          const parentIdArray = cleanedFilters.parentId as string[];
+          userCohorts = userCohorts.filter(
+            cohort => cohort.parentId && parentIdArray.includes(cohort.parentId)
+          );
+        }
+
+        // Filter by cohortId
+        if (cleanedFilters.cohortId && Array.isArray(cleanedFilters.cohortId) && cleanedFilters.cohortId.length > 0) {
+          const cohortIdArray = cleanedFilters.cohortId as string[];
+          userCohorts = userCohorts.filter(
+            cohort => cohortIdArray.includes(cohort.cohortId)
+          );
+        }
+
+        // Filter by type
+        if (cleanedFilters.type && typeof cleanedFilters.type === 'string') {
+          const typeFilter = cleanedFilters.type.toLowerCase();
+          userCohorts = userCohorts.filter(
+            cohort => cohort.type?.toLowerCase() === typeFilter
+          );
+        }
+
+        // Filter by status
+        if (cleanedFilters.status && Array.isArray(cleanedFilters.status) && cleanedFilters.status.length > 0) {
+          const statusArray = cleanedFilters.status as string[];
+          userCohorts = userCohorts.filter(
+            cohort => statusArray.includes(cohort.status)
+          );
+        }
+
+        // Filter by name (case-insensitive partial match)
+        if (cleanedFilters.name && typeof cleanedFilters.name === 'string') {
+          const nameFilter = cleanedFilters.name.toLowerCase();
+          userCohorts = userCohorts.filter(
+            cohort => cohort.name?.toLowerCase().includes(nameFilter)
+          );
+        }
+      }
+
+      if (userCohorts.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      // Step 2: Collect unique centers (from batches via parentId or direct center assignments)
+      const centerBatchMap = new Map<string, any[]>();
+      const centerIds = new Set<string>();
+
+      for (const cohort of userCohorts) {
+        let centerId: string;
+
+        if (cohort.type?.toLowerCase() === 'batch' && cohort.parentId) {
+          // Batch: get parent center
+          centerId = cohort.parentId;
+          if (!centerBatchMap.has(centerId)) {
+            centerBatchMap.set(centerId, []);
+          }
+          const batches = centerBatchMap.get(centerId);
+          const alreadyAdded = batches.some((b) => b.batchId === cohort.cohortId);
+          if (!alreadyAdded) {
+            batches.push({
+              batchId: cohort.cohortId,
+              batchName: cohort.name
+            });
+          }
+        } else if (cohort.type?.toLowerCase() === 'center' || cohort.type?.toLowerCase() === 'cohort') {
+          // Direct center assignment
+          centerId = cohort.cohortId;
+          if (!centerBatchMap.has(centerId)) {
+            centerBatchMap.set(centerId, []);
+          }
+        } else {
+          continue;
+        }
+
+        centerIds.add(centerId);
+      }
+
+      if (centerIds.size === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      // Step 3: Get SDBV data for centers using existing getCustomFieldDetails method
+      const centerIdsArray = Array.from(centerIds);
+      const centers = await this.cohortRepository.find({
+        where: { cohortId: In(centerIdsArray) },
+        select: ['cohortId', 'name']
       });
+
+      const centerGeoDataMap = new Map<string, any>();
+      const geoFilters = filters ? {
+        state: filters.state,
+        district: filters.district,
+        block: filters.block,
+        village: filters.village,
+        customFieldsName: filters.customFieldsName
+      } : null;
+
+      // Process each center using existing method
+      for (const center of centers) {
+        // Use existing getCustomFieldDetails method (same as used in other APIs)
+        const customFields = await this.fieldsService.getCustomFieldDetails(
+          center.cohortId,
+          'Cohort'
+        );
+
+        const geoData: any = {
+          stateId: null,
+          stateName: null,
+          districtId: null,
+          districtName: null,
+          blockId: null,
+          blockName: null,
+          villageId: null,
+          villageName: null
+        };
+
+        // Extract SDBV from custom fields (same pattern as used in cron.service.ts)
+        for (const field of customFields) {
+          const fieldLabel = field.label?.toLowerCase();
+          const fieldName = field.name?.toLowerCase();
+
+          // Check both label and name (as done in other services)
+          if ((fieldLabel === 'state' || fieldName === 'state') && field.selectedValues?.[0]) {
+            const val = field.selectedValues[0];
+            if (val && typeof val === 'object') {
+              geoData.stateId = val.id || val.value || null;
+              geoData.stateName = val.label || val.value || null;
+            }
+          } else if ((fieldLabel === 'district' || fieldName === 'district') && field.selectedValues?.[0]) {
+            const val = field.selectedValues[0];
+            if (val && typeof val === 'object') {
+              geoData.districtId = val.id || val.value || null;
+              geoData.districtName = val.label || val.value || null;
+            }
+          } else if ((fieldLabel === 'block' || fieldName === 'block') && field.selectedValues?.[0]) {
+            const val = field.selectedValues[0];
+            if (val && typeof val === 'object') {
+              geoData.blockId = val.id || val.value || null;
+              geoData.blockName = val.label || val.value || null;
+            }
+          } else if ((fieldLabel === 'village' || fieldName === 'village') && field.selectedValues?.[0]) {
+            const val = field.selectedValues[0];
+            if (val && typeof val === 'object') {
+              geoData.villageId = val.id || val.value || null;
+              geoData.villageName = val.label || val.value || null;
+            }
+          }
+        }
+
+        // Apply geographical filters if provided
+        let shouldInclude = true;
+        if (geoFilters) {
+          // Filter by state
+          if (geoFilters.state && Array.isArray(geoFilters.state) && geoFilters.state.length > 0) {
+            if (!geoData.stateId || !geoFilters.state.includes(geoData.stateId)) {
+              shouldInclude = false;
+            }
+          }
+
+          // Filter by district
+          if (shouldInclude && geoFilters.district && Array.isArray(geoFilters.district) && geoFilters.district.length > 0) {
+            if (!geoData.districtId || !geoFilters.district.includes(geoData.districtId)) {
+              shouldInclude = false;
+            }
+          }
+
+          // Filter by block
+          if (shouldInclude && geoFilters.block && Array.isArray(geoFilters.block) && geoFilters.block.length > 0) {
+            if (!geoData.blockId || !geoFilters.block.includes(geoData.blockId)) {
+              shouldInclude = false;
+            }
+          }
+
+          // Filter by village
+          if (shouldInclude && geoFilters.village && Array.isArray(geoFilters.village) && geoFilters.village.length > 0) {
+            if (!geoData.villageId || !geoFilters.village.includes(geoData.villageId)) {
+              shouldInclude = false;
+            }
+          }
+
+          // Filter by customFieldsName
+          if (shouldInclude && geoFilters.customFieldsName && typeof geoFilters.customFieldsName === 'object') {
+            // Apply custom field filters using fieldsService
+            const customFieldMatches = await this.fieldsService.filterUserUsingCustomFields(
+              'COHORT',
+              geoFilters.customFieldsName
+            );
+            if (customFieldMatches && !customFieldMatches.includes(center.cohortId)) {
+              shouldInclude = false;
+            }
+          }
+        }
+
+        if (shouldInclude) {
+          centerGeoDataMap.set(center.cohortId, {
+            centerId: center.cohortId,
+            centerName: center.name,
+            ...geoData,
+            batches: centerBatchMap.get(center.cohortId) || []
+          });
+        }
+      }
+
+      // Step 5: Build reverse geographical hierarchy
+      const hierarchyMap = new Map<string, Map<string, Map<string, any[]>>>(); // state -> district -> block -> centers
+
+      for (const [centerId, centerData] of centerGeoDataMap.entries()) {
+        const stateKey = centerData.stateId || 'unknown';
+        const districtKey = centerData.districtId || 'unknown';
+        const blockKey = centerData.blockId || 'unknown';
+
+        if (!hierarchyMap.has(stateKey)) {
+          hierarchyMap.set(stateKey, new Map());
+        }
+        const stateMap = hierarchyMap.get(stateKey);
+
+        if (!stateMap.has(districtKey)) {
+          stateMap.set(districtKey, new Map());
+        }
+        const districtMap = stateMap.get(districtKey);
+
+        if (!districtMap.has(blockKey)) {
+          districtMap.set(blockKey, []);
+        }
+        districtMap.get(blockKey).push({
+          centerId: centerData.centerId,
+          centerName: centerData.centerName,
+          batches: centerData.batches
+        });
+      }
+
+      // Step 6: Convert map structure to response format
+      const result = [];
+
+      for (const [stateId, districtMap] of hierarchyMap.entries()) {
+        const stateData: any = {
+          stateId: stateId === 'unknown' ? null : stateId,
+          stateName: 'Unknown',
+          districts: []
+        };
+
+        // Get state name from first center in this state
+        const firstCenter = Array.from(districtMap.values())[0]?.get(Array.from(Array.from(districtMap.values())[0].keys())[0])?.[0];
+        if (firstCenter) {
+          const centerGeo = centerGeoDataMap.get(firstCenter.centerId);
+          if (centerGeo && centerGeo.stateName) {
+            stateData.stateName = centerGeo.stateName;
+          }
+        }
+
+        for (const [districtId, blockMap] of districtMap.entries()) {
+          const districtData: any = {
+            districtId: districtId === 'unknown' ? null : districtId,
+            districtName: 'Unknown',
+            blocks: []
+          };
+
+          // Get district name from first center in this district
+          const firstBlockCenter = Array.from(blockMap.values())[0]?.[0];
+          if (firstBlockCenter) {
+            const centerGeo = centerGeoDataMap.get(firstBlockCenter.centerId);
+            if (centerGeo && centerGeo.districtName) {
+              districtData.districtName = centerGeo.districtName;
+            }
+          }
+
+          for (const [blockId, centers] of blockMap.entries()) {
+            const blockData: any = {
+              blockId: blockId === 'unknown' ? null : blockId,
+              blockName: 'Unknown',
+              centers: []
+            };
+
+            // Get block name from first center in this block
+            if (centers.length > 0) {
+              const centerGeo = centerGeoDataMap.get(centers[0].centerId);
+              if (centerGeo && centerGeo.blockName) {
+                blockData.blockName = centerGeo.blockName;
+              }
+            }
+
+            // Add centers (without batches in center object, batches are separate)
+            blockData.centers = centers.map(center => ({
+              centerId: center.centerId,
+              centerName: center.centerName,
+              batches: center.batches || []
+            }));
+
+            districtData.blocks.push(blockData);
+          }
+
+          stateData.districts.push(districtData);
+        }
+
+        result.push(stateData);
+      }
+
+      // Step 7: Apply pagination
+      const totalCount = result.length;
+      const paginatedResult = result.slice(paginationOffset, paginationOffset + paginationLimit);
+      const currentPageCount = paginatedResult.length;
+
+      LoggerUtil.log(
+        "User geographical hierarchy fetched successfully",
+        apiId
+      );
+
+      return APIResponse.success(
+        res,
+        apiId,
+        {
+          data: paginatedResult,
+          totalCount: totalCount,
+          currentPageCount: currentPageCount,
+          limit: paginationLimit,
+          offset: paginationOffset
+        },
+        HttpStatus.OK,
+        "User geographical hierarchy fetched successfully"
+      );
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      );
+      const errorMessage = error.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
     }
   }
 }

@@ -1,0 +1,443 @@
+import {
+  BadRequestException,
+  ConsoleLogger,
+  HttpStatus,
+  Injectable,
+  Inject,
+} from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { In, Repository } from "typeorm";
+import { SuccessResponse } from "src/success-response";
+import { ErrorResponseTypeOrm } from "src/error-response-typeorm";
+import {
+  CreateAssignRoleDto,
+  ResponseAssignRoleDto,
+} from "src/rbac/assign-role/dto/create-assign-role.dto";
+import {
+  UserRoleMapping,
+  UserRoleMappingStatus,
+} from "src/rbac/assign-role/entities/assign-role.entity";
+import { getAuditContext } from "@utils/audit-helper";
+import { Role } from "src/rbac/role/entities/role.entity";
+import { IsAlpha, IsUUID, isUUID } from "class-validator";
+import { executionAsyncResource } from "async_hooks";
+import { DeleteAssignRoleDto } from "src/rbac/assign-role/dto/delete-assign-role.dto";
+import { Response } from "express";
+import { APIID } from "src/common/utils/api-id.config";
+import APIResponse from "src/common/responses/response";
+import { CacheService } from "../../cache/cache.service";
+import { AuditLoggerService } from "@tekdi/audit-logger/nestjs";
+import { LoggerUtil } from "src/common/logger/LoggerUtil";
+
+@Injectable()
+export class AssignRoleService {
+  constructor(
+    @InjectRepository(UserRoleMapping)
+    private readonly userRoleMappingRepository: Repository<UserRoleMapping>,
+    @InjectRepository(Role)
+    private readonly roleRepository: Repository<Role>,
+    private readonly cacheService: CacheService,
+    @Inject(AuditLoggerService)
+    private readonly auditLoggerService: AuditLoggerService
+  ) { }
+
+  private emitAuditSafely(event: any): void {
+    try {
+      this.auditLoggerService.emit(event);
+    } catch (err: any) {
+      LoggerUtil.error(`Audit emission failed: ${err?.message || err}`, "", "AuditLogger");
+    }
+  }
+
+  public async createAssignRole(
+    createAssignRoleDto: CreateAssignRoleDto,
+    response: Response
+  ) {
+    const apiId = APIID.USERROLE_CREATE;
+    try {
+      const userId = createAssignRoleDto.userId;
+      const roles = createAssignRoleDto.roleId;
+      const tenantId = createAssignRoleDto.tenantId;
+
+      // Check if roles array is not empty
+      if (!roles || roles.length === 0) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Roles array cannot be empty.`,
+          "empty array found",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      const result = [];
+      const errors = [];
+
+      for (const roleId of roles) {
+        // If role already exists for user, return error response
+        const findExistingRole = await this.userRoleMappingRepository.findOne({
+          where: {
+            userId: userId,
+            roleId: roleId,
+          },
+        });
+        if (findExistingRole) {
+          errors.push({
+            errorMessage: `Role ${roleId} is already assigned to this user.`,
+          });
+          continue;
+        }
+
+        //Rele is belong for this tenent
+        const roleExistforTenant = await this.roleRepository.findOne({
+          where: {
+            roleId: roleId,
+            tenantId: tenantId,
+          },
+        });
+        if (!roleExistforTenant) {
+          errors.push({
+            errorMessage: `Role ${roleId} is not exist for this tenant.`,
+          });
+          continue;
+        }
+
+        const auditCtx = getAuditContext();
+        const data = await this.userRoleMappingRepository.save({
+          userId: userId,
+          roleId: roleId,
+          tenantId: tenantId,
+          createdBy: auditCtx.actorId,
+          updatedBy: auditCtx.actorId,
+        });
+
+        this.emitAuditSafely({
+          entityType: "USER_ROLE",
+          entityId: data.userRolesId,
+          eventAction: "CREATED",
+          ...auditCtx,
+          metadata: {
+            tenantId: tenantId
+          }
+        });
+        result.push(
+          new ResponseAssignRoleDto(
+            data,
+            `Role assigned successfully to the user in the specified tenant.`
+          )
+        );
+      }
+
+      if (result.length == 0) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Please Enter Valid User ID`,
+          "Invalid User ID",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      await this.cacheService.invalidate([`user:${userId}`, `userroles:${userId}`, `userlist:${tenantId}`]);
+      return APIResponse.success(
+        response,
+        apiId,
+        {
+          successCount: result.length,
+          errorCount: errors.length,
+          result,
+          errors,
+        },
+        HttpStatus.CREATED,
+        "Role successfully Created"
+      );
+    } catch (error) {
+      if (error.code === "23503") {
+        return APIResponse.error(
+          response,
+          apiId,
+          `User Id or Role Id Doesn't Exist in Database`,
+          "Not found",
+          HttpStatus.NOT_FOUND
+        );
+      }
+      const errorMessage = error.message || "Internal server error";
+      return APIResponse.error(
+        response,
+        apiId,
+        "Internal Server Error",
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  public async getAssignedRole(
+    userId: string,
+    response: Response
+  ) {
+    const apiId = APIID.USERROLE_GET;
+    try {
+      if (!isUUID(userId)) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `Please Enter Valid User ID`,
+          "Invalid User ID",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      // Keyed by userId alone: this read has no tenant filter, and the delete
+      // write path carries no tenantId to invalidate with.
+      const result = await this.cacheService.getOrLoad({
+        namespace: `userroles:${userId}`,
+        key: "role",
+        ttlSeconds: 600,
+        loader: () => this.checkExistingRole(userId),
+      });
+      if (!result) {
+        return APIResponse.error(
+          response,
+          apiId,
+          `User Id or Role Id Doesn't Exist in Database`,
+          "Not found",
+          HttpStatus.NOT_FOUND
+        );
+      }
+      return APIResponse.success(
+        response,
+        apiId,
+        result,
+        HttpStatus.OK,
+        "User role fetched successfully"
+      );
+    } catch (error) {
+      const errorMessage = error.message || "Internal server error";
+      return APIResponse.error(
+        response,
+        apiId,
+        "Internal Server Error",
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  public async deleteAssignedRole(
+    deleteAssignRoleDto: DeleteAssignRoleDto,
+    res: Response
+  ) {
+    const apiId = APIID.USERROLE_DELETE;
+    try {
+      // Validate userId format
+      if (!isUUID(deleteAssignRoleDto.userId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          `Invalid userId format. Please provide a valid UUID.`,
+          "Invalid UUID",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      // Target status to set (must be provided: active | archived)
+      const targetStatus = deleteAssignRoleDto.status;
+      if (!Object.values(UserRoleMappingStatus).includes(targetStatus)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          `Invalid status. Allowed values: ${Object.values(UserRoleMappingStatus).join(", ")}`,
+          "Invalid status",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      // Only rows currently in the opposite status can be moved to the target
+      const currentStatus =
+        targetStatus === UserRoleMappingStatus.ARCHIVED
+          ? UserRoleMappingStatus.ACTIVE
+          : UserRoleMappingStatus.ARCHIVED;
+      // Validate roleId format
+      for (const roleId of deleteAssignRoleDto.roleId) {
+        if (!isUUID(roleId)) {
+          return APIResponse.error(
+            res,
+            apiId,
+            `Invalid roleId format. Please provide valid UUIDs`,
+            "Invalid UUID",
+            HttpStatus.BAD_REQUEST
+          );
+        }
+      }
+      // Check if the userId exists in userRoleMapping table
+      const userExists = await this.userRoleMappingRepository.findOne({
+        where: { userId: deleteAssignRoleDto.userId },
+      });
+      if (!userExists) {
+        return APIResponse.error(
+          res,
+          apiId,
+          `User not found in userRoleMapping table`,
+          "User not found",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      // Check if all roleId(s) exist
+      const roleExists = await this.userRoleMappingRepository.find({
+        where: {
+          userId: deleteAssignRoleDto.userId,
+          roleId: In(deleteAssignRoleDto.roleId),
+          tenantId: deleteAssignRoleDto.tenantId, // Ensure the tenantId is also checked
+          status: currentStatus,
+        },
+      });
+      // If any roleId(s) are missing, throw an error
+      if (roleExists.length !== deleteAssignRoleDto.roleId.length) {
+        return APIResponse.error(
+          res,
+          apiId,
+          `Roles not found for the user`,
+          "Roles not found",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      // If all validations pass, set the requested status (soft delete / restore)
+      const response = await this.userRoleMappingRepository.update(
+        {
+          userId: deleteAssignRoleDto.userId,
+          roleId: In(deleteAssignRoleDto.roleId),
+          tenantId: deleteAssignRoleDto.tenantId,
+          status: currentStatus,
+        },
+        { status: targetStatus }
+      );
+      // Invalidate the tenant lists of the affected mappings (roleExists).
+      await this.cacheService.invalidate([
+        `user:${deleteAssignRoleDto.userId}`,
+        `userroles:${deleteAssignRoleDto.userId}`,
+        ...[...new Set(roleExists.map((m) => m.tenantId).filter(Boolean))].map((t) => `userlist:${t}`),
+      ]);
+
+      // Audit Log for each deleted role
+      const auditCtx = getAuditContext();
+      for (const roleId of deleteAssignRoleDto.roleId) {
+        this.emitAuditSafely({
+          entityType: "USER_ROLE",
+          entityId: `User:${deleteAssignRoleDto.userId}|Role:${roleId}`,
+          eventAction:
+            targetStatus === UserRoleMappingStatus.ARCHIVED ? "DELETED" : "UPDATED",
+          ...auditCtx,
+          metadata: {
+            userId: deleteAssignRoleDto.userId,
+            roleId: roleId,
+            status: targetStatus,
+          }
+        });
+      }
+      return APIResponse.success(
+        res,
+        apiId,
+        { rowCount: response.affected },
+        HttpStatus.OK,
+        targetStatus === UserRoleMappingStatus.ARCHIVED
+          ? "Roles archived successfully."
+          : "Roles restored successfully."
+      );
+    } catch (e) {
+      const errorMessage = e.message || "Internal server error";
+      return APIResponse.error(
+        res,
+        apiId,
+        "Internal Server Error",
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  //    async checkAndAddUserRole(data){
+  //     let existingUser = await this.checkExistingRole(data.userId) ;
+  //     if(existingUser){
+  //         let update  =
+  //     }
+  //    }
+
+  public async bulkUpdateUserRoles(
+    userIds: string[],
+    roleId: string,
+    tenantId: string,
+    updatedBy: string,
+    res: Response
+  ) {
+    const apiId = APIID.USERROLE_BULK_UPDATE;
+    try {
+      const errors: { userId: string; error: string }[] = [];
+      const updated: string[] = [];
+
+      for (const userId of userIds) {
+        const existing = await this.userRoleMappingRepository.findOne({
+          where: { userId, tenantId },
+        });
+        if (!existing) {
+          errors.push({ userId, error: "User not found in UserRolesMapping for the specified tenant" });
+          continue;
+        }
+
+        await this.userRoleMappingRepository.update(
+          { userId, tenantId },
+          { roleId, updatedBy }
+        );
+        updated.push(userId);
+
+        const auditCtx = getAuditContext();
+        this.emitAuditSafely({
+          entityType: "USER_ROLE",
+          entityId: `User:${userId}|Tenant:${tenantId}`,
+          eventAction: "UPDATED",
+          ...auditCtx,
+          metadata: {
+            userId,
+            tenantId,
+            roleId
+          }
+        });
+      }
+
+      if (updated.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "None of the provided userIds exist in UserRolesMapping",
+          "Not found",
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      await this.cacheService.invalidate([
+        ...updated.map((id) => `user:${id}`),
+        ...updated.map((id) => `userroles:${id}`),
+        `userlist:${tenantId}`,
+      ]);
+
+      return APIResponse.success(
+        res,
+        apiId,
+        { updatedCount: updated.length, updated, errorCount: errors.length, errors },
+        HttpStatus.OK,
+        "User roles updated successfully"
+      );
+    } catch (error) {
+      return APIResponse.error(
+        res,
+        apiId,
+        "Internal Server Error",
+        error.message || "Internal server error",
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  async checkExistingRole(userId) {
+    const result = await this.userRoleMappingRepository.findOne({
+      where: { userId },
+    });
+    return result;
+  }
+}

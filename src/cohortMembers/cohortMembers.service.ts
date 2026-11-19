@@ -1,0 +1,1506 @@
+import { Injectable } from "@nestjs/common";
+import { AuditLoggerService } from "@tekdi/audit-logger/nestjs";
+import { CohortMembersDto } from "src/cohortMembers/dto/cohortMembers.dto";
+import { CohortMembersSearchDto } from "src/cohortMembers/dto/cohortMembers-search.dto";
+import { CohortMembers } from "src/cohortMembers/entities/cohort-member.entity";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository } from "typeorm";
+import { FieldsService } from "src/fields/fields.service";
+import { HttpStatus } from "@nestjs/common";
+import { User } from "src/user/entities/user-entity";
+import { CohortMembersUpdateDto } from "src/cohortMembers/dto/cohortMember-update.dto";
+import { Fields } from "src/fields/entities/fields.entity";
+import { isUUID } from "class-validator";
+import { Cohort } from "src/cohort/entities/cohort.entity";
+import APIResponse from "src/common/responses/response";
+import { response, Response } from "express";
+import { APIID } from "src/common/utils/api-id.config";
+import { MemberStatus } from "src/cohortMembers/entities/cohort-member.entity";
+import { NotificationRequest } from "@utils/notification.axios";
+import { CohortAcademicYear } from "src/cohortAcademicYear/entities/cohortAcademicYear.entity";
+import { AcademicYearService } from "src/academicyears/academicyears.service";
+import { API_RESPONSES } from "@utils/response.messages";
+import { LoggerUtil } from "src/common/logger/LoggerUtil";
+import { UserService } from "src/user/user.service";
+import { isValid } from "date-fns";
+import { FieldValuesOptionDto } from "src/user/dto/user-create.dto";
+import { KafkaService } from "src/kafka/kafka.service";
+import { CacheService } from "../cache/cache.service";
+import { hashCacheKey } from "../cache/cache-key.util";
+
+const COHORTMEMBER_TTL_SECONDS = 180; // cohortmember:{tenantId}, 3 min
+import { BulkCohortMember } from "src/cohortMembers/dto/bulkMember-create.dto";
+import { getAuditContext } from "@utils/audit-helper";
+
+@Injectable()
+export class CohortMembersService {
+  constructor(
+    @InjectRepository(CohortMembers)
+    private cohortMembersRepository: Repository<CohortMembers>,
+    @InjectRepository(Fields)
+    private fieldsRepository: Repository<Fields>,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
+    @InjectRepository(Cohort)
+    private cohortRepository: Repository<Cohort>,
+    @InjectRepository(CohortAcademicYear)
+    private readonly cohortAcademicYearRespository: Repository<CohortAcademicYear>,
+    private readonly academicyearService: AcademicYearService,
+    private readonly notificationRequest: NotificationRequest,
+    private fieldsService: FieldsService,
+    private userService: UserService,
+    private readonly kafkaService: KafkaService,
+    private readonly cacheService: CacheService,
+    private readonly auditLoggerService: AuditLoggerService
+  ) { }
+
+  private emitAuditSafely(event: any): void {
+    try {
+      this.auditLoggerService.emit(event);
+    } catch (err: any) {
+      LoggerUtil.error(`Audit emission failed: ${err?.message || err}`, "", "AuditLogger");
+    }
+  }
+
+  //Get cohort member
+  // Wrapper writes the response; the inner method returns the payload or
+  // writes errors directly.
+  async getCohortMembers(
+    cohortId: any,
+    tenantId: any,
+    fieldvalue: any,
+    academicYearId: string,
+    res: Response
+  ) {
+    if (!tenantId) {
+      return APIResponse.error(res, APIID.COHORT_MEMBER_GET, API_RESPONSES.BAD_REQUEST, API_RESPONSES.TANANT_ID_REQUIRED, HttpStatus.BAD_REQUEST);
+    }
+    const payload = await this.cacheService.getOrLoad({
+      namespace: `cohortmember:${tenantId}`,
+      key: `read:${cohortId}:${academicYearId}:cf${(fieldvalue || "").toLowerCase() === "true" ? 1 : 0}`,
+      dependsOn: ["fieldsdef", `userlist:${tenantId}`],
+      ttlSeconds: COHORTMEMBER_TTL_SECONDS,
+      loader: async () => {
+        const result = await this.getCohortMembersData(cohortId, tenantId, fieldvalue, academicYearId, res);
+        return res.headersSent ? null : result;
+      },
+    });
+    if (payload === null || payload === undefined) {
+      return; // error response already written in the loader
+    }
+    return APIResponse.success(res, APIID.COHORT_MEMBER_GET, payload, HttpStatus.OK, API_RESPONSES.COHORT_MEMBER_GET_SUCCESSFULLY);
+  }
+
+  private async getCohortMembersData(
+    cohortId: any,
+    tenantId: any,
+    fieldvalue: any,
+    academicYearId: string,
+    res: Response
+  ) {
+    const apiId = APIID.COHORT_MEMBER_GET;
+    try {
+      const fieldvalues = fieldvalue?.toLowerCase();
+
+      if (!tenantId) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.TANANT_ID_REQUIRED,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      if (!isUUID(cohortId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.COHORT_VALID_UUID,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      const cohortAcademicYearMap = await this.isCohortExistForYear(
+        academicYearId,
+        cohortId
+      );
+      if (cohortAcademicYearMap.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.NOT_FOUND,
+          API_RESPONSES.ACADEMICYEAR_COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+      const cohortAcademicyearId =
+        cohortAcademicYearMap[0].cohortAcademicYearId;
+      const userDetails = await this.findcohortData(
+        cohortId,
+        cohortAcademicyearId
+      );
+      if (userDetails === true) {
+        const results = {
+          userDetails: [],
+        };
+
+        const cohortDetails = await this.getUserDetails(
+          cohortId,
+          "cohortId",
+          fieldvalues,
+          cohortAcademicyearId
+        );
+        results.userDetails.push(cohortDetails);
+
+        // Raw payload for the caching wrapper; the outer method writes success.
+        return results;
+      } else {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.NOT_FOUND,
+          API_RESPONSES.COHORTMEMBER_NOTFOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+    } catch (e) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${e.message}`,
+        apiId
+      )
+      const errorMessage = e.message || API_RESPONSES.INTERNAL_SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.INTERNAL_SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+  async getUserDetails(
+    searchId: any,
+    searchKey: any,
+    fieldShowHide: any,
+    cohortAcademicyearId: string
+  ) {
+    const results = {
+      userDetails: [],
+    };
+
+    const getUserDetails = await this.findUserName(
+      searchId,
+      searchKey,
+      cohortAcademicyearId
+    );
+
+    for (const data of getUserDetails) {
+      const userDetails = {
+        userId: data?.userId,
+        userName: data?.userName,
+        name: data?.name,
+        role: data?.role,
+        district: data?.district,
+        state: data?.state,
+        mobile: data?.mobile,
+        status: data?.status,
+        statusReason: data?.statusReason,
+        cohortMembershipId: data?.cohortMembershipId,
+      };
+
+      if (fieldShowHide === "true") {
+        const fieldValues = await this.getFieldandFieldValues(data.userId);
+        userDetails["customField"] = fieldValues;
+        results.userDetails.push(userDetails);
+      } else {
+        results.userDetails.push(userDetails);
+      }
+    }
+
+    return results;
+  }
+
+  async findFilledValues(userId: string) {
+    const query = `SELECT U."userId",F."fieldId",F."value" FROM public."Users" U
+    LEFT JOIN public."FieldValues" F
+    ON U."userId" = F."itemId" where U."userId" =$1`;
+    const result = await this.usersRepository.query(query, [userId]);
+    return result;
+  }
+
+  async findcohortData(cohortId: any, cohortAcademicYearId: string) {
+    const whereClause: any = {
+      cohortId: cohortId,
+      cohortAcademicYearId: cohortAcademicYearId,
+    };
+    const userDetails = await this.cohortMembersRepository.find({
+      where: whereClause,
+    });
+    if (userDetails.length !== 0) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  async findCustomFields(role) {
+    const customFields = await this.fieldsRepository.find({
+      where: {
+        context: "USERS",
+        contextType: role.toUpperCase(),
+      },
+    });
+    return customFields;
+  }
+
+  async getFieldandFieldValues(userId: string) {
+    const query = `SELECT Fv."fieldId",F."label" AS FieldName,Fv."value" as FieldValues
+    FROM public."FieldValues" Fv
+    LEFT JOIN public."Fields" F
+    ON F."fieldId" = Fv."fieldId"
+    where Fv."itemId" =$1 `;
+    const result = await this.usersRepository.query(query, [userId]);
+    return result;
+  }
+
+  async findUserName(searchData: string, searchKey: any, cohortAcademicYear) {
+    let whereCase;
+    if (searchKey == "cohortId") {
+      whereCase = `where CM."cohortId" =$1`;
+    } else {
+      whereCase = `where CM."userId" =$1`;
+    }
+    const query = `SELECT U."userId", U."username", U."firstName", U."middleName", U."lastName", U."mobile",
+ CM."status", CM."statusReason", CM."cohortMembershipId"
+ FROM public."CohortMembers" CM
+LEFT JOIN public."Users" U
+ON CM."userId" = U."userId" ${whereCase}`;
+
+    const result = await this.usersRepository.query(query, [searchData]);
+    return result;
+  }
+
+  // Loader returns the payload; the wrapper writes the success response. Error
+  // branches write directly, which the headersSent check detects so their
+  // (null) result is never cached.
+  public async searchCohortMembers(
+    cohortMembersSearchDto: CohortMembersSearchDto,
+    tenantId: string,
+    academicyearId: string,
+    res: Response
+  ) {
+    const payload = await this.cacheService.getOrLoad({
+      namespace: `cohortmember:${tenantId}`,
+      key: `list:${hashCacheKey({ cohortMembersSearchDto, academicyearId })}`,
+      dependsOn: ["fieldsdef", `userlist:${tenantId}`],
+      ttlSeconds: COHORTMEMBER_TTL_SECONDS,
+      loader: async () => {
+        const result = await this.searchCohortMembersData(cohortMembersSearchDto, tenantId, academicyearId, res);
+        return res.headersSent ? null : result;
+      },
+    });
+    if (payload === null || payload === undefined) {
+      return; // an error response was already written inside the loader
+    }
+    return APIResponse.success(res, APIID.COHORT_MEMBER_SEARCH, payload, HttpStatus.OK, API_RESPONSES.COHORT_GET_SUCCESSFULLY);
+  }
+
+  private async searchCohortMembersData(
+    cohortMembersSearchDto: CohortMembersSearchDto,
+    tenantId: string,
+    academicyearId: string,
+    res: Response
+  ) {
+    const apiId = APIID.COHORT_MEMBER_SEARCH;
+    try {
+      if (!isUUID(tenantId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.TENANT_ID_NOTFOUND,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      let { limit, offset } = cohortMembersSearchDto;
+      const { sort, filters } = cohortMembersSearchDto;
+      offset = offset || 0;
+      limit = limit || 0;
+      let results = {};
+      const where = [];
+      const options = [];
+
+      const whereClause = {};
+      if (filters && Object.keys(filters).length > 0) {
+        Object.entries(filters).forEach(([key, value]) => {
+          whereClause[key] = value;
+        });
+      }
+
+      let cohortYearExistInYear = [],
+        userYearExistInYear = [],
+        finalExistRecord = [];
+      // Check if cohortId exists for passing year
+      if (whereClause["cohortId"]) {
+        const getYearExistRecord = await this.isCohortExistForYear(
+          academicyearId,
+          cohortMembersSearchDto.filters.cohortId
+        );
+        if (getYearExistRecord.length === 0) {
+          return APIResponse.error(
+            res,
+            apiId,
+            API_RESPONSES.COHORT_NOTFOUND,
+            API_RESPONSES.NOT_FOUND,
+            HttpStatus.NOT_FOUND
+          );
+        }
+        cohortYearExistInYear = getYearExistRecord.map(
+          (item) => item.cohortAcademicYearId
+        );
+        finalExistRecord = [...cohortYearExistInYear];
+      }
+
+      // Check if userId exists for passing year
+      if (whereClause["userId"]) {
+        const getYearExitUser = await this.isUserExistForYear(
+          academicyearId,
+          cohortMembersSearchDto.filters.userId
+        );
+        if (getYearExitUser.length === 0) {
+          return APIResponse.error(
+            res,
+            apiId,
+            API_RESPONSES.USER_NOTFOUND,
+            API_RESPONSES.NOT_FOUND,
+            HttpStatus.NOT_FOUND
+          );
+        }
+        userYearExistInYear = getYearExitUser.map(
+          (item) => item.cohortAcademicYearId
+        );
+        finalExistRecord = [...userYearExistInYear];
+      }
+
+      // Validate if both cohortId and userId match in the same academic year
+      if (
+        whereClause["userId"] &&
+        whereClause["cohortId"] &&
+        cohortYearExistInYear[0] !== userYearExistInYear[0]
+      ) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.COHORT_USER_NOTFOUND,
+          API_RESPONSES.NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+      // Add cohortAcademicYearId filter if applicable
+      if (finalExistRecord.length > 0) {
+        whereClause["cohortAcademicYearId"] = finalExistRecord;
+      }
+      const whereKeys = [
+        "cohortId",
+        "userId",
+        "role",
+        "name",
+        "firstName",
+        "middleName",
+        "lastName",
+        "status",
+        "cohortAcademicYearId",
+        "cohortMemberRole",
+      ];
+      whereKeys.forEach((key) => {
+        if (whereClause[key]) {
+          where.push([key, whereClause[key]]);
+        }
+      });
+
+      if (limit) options.push(["limit", limit]);
+      if (offset) options.push(["offset", offset]);
+
+      const order = {};
+      if (sort) {
+        const [sortField, sortOrder] = sort;
+        order[sortField] = sortOrder;
+      }
+
+      results = await this.getCohortMemberUserDetails(
+        where,
+        "true",
+        options,
+        order,
+        tenantId
+      );
+
+      if (results["userDetails"].length == 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.NOT_FOUND,
+          API_RESPONSES.USER_DETAIL_NOTFOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+      // Raw payload for the caching wrapper; the outer method writes success.
+      return results;
+    } catch (e) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${e.message}`,
+        apiId
+      )
+      const errorMessage = e.message || API_RESPONSES.INTERNAL_SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.INTERNAL_SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  async isCohortExistForYear(yearId, cohortId) {
+    return await this.cohortAcademicYearRespository.find({
+      where: { academicYearId: yearId, cohortId: cohortId },
+    });
+  }
+
+  async isUserExistForYear(yearId, userId) {
+    // Join query with yearId, userId, academicYearId on CohortMember and CohortAcademicyear table
+    const query = `
+        SELECT 
+            cm."cohortMembershipId",
+            cm."createdAt",
+            cm."updatedAt",
+            cm."cohortId",
+            cm."userId",
+            cm."status",
+            cm."statusReason",
+            cm."cohortAcademicYearId",
+            cay."academicYearId"
+        FROM 
+            public."CohortMembers" cm
+        JOIN 
+            public."CohortAcademicYear" cay ON cm."cohortAcademicYearId" = cay."cohortAcademicYearId"
+        WHERE 
+            cm."userId" = $1 AND 
+            cay."academicYearId" = $2;
+    `;
+    const result = await this.cohortMembersRepository.query(query, [
+      userId,
+      yearId,
+    ]);
+    return result;
+  }
+
+  async getCohortMemberUserDetails(
+    where: any,
+    fieldShowHide: any,
+    options: any,
+    order: any,
+    tenantId: string
+  ) {
+    const results = {
+      totalCount: 0,
+      userDetails: [],
+    };
+
+    const getUserDetails = await this.getUsers(where, options, order, tenantId);
+
+    if (getUserDetails.length > 0) {
+      results.totalCount = parseInt(getUserDetails[0].total_count, 10);
+
+      // One bulk call into the same ufields-cached path the user module uses,
+      // instead of a per-user getCustomFieldDetails (also removes the N+1).
+      const bulkUserFields =
+        fieldShowHide === "false"
+          ? {}
+          : await this.fieldsService.getBulkCustomFieldDetails(
+              getUserDetails.map((d) => d.userId),
+              "Users"
+            );
+
+      for (const data of getUserDetails) {
+        if (fieldShowHide === "false") {
+          results.userDetails.push(data);
+        } else {
+          const fieldValues = bulkUserFields[data.userId] || [];
+          //get data by cohort membership Id
+          let fieldValuesForCohort =
+            await this.fieldsService.getFieldsAndFieldsValues(
+              data.cohortMembershipId
+            );
+          fieldValuesForCohort = fieldValuesForCohort.map((field) => {
+            return {
+              fieldId: field?.fieldId,
+              label: field?.label,
+              selectedValues: field?.selectedValues,
+              type: field?.type,
+            };
+          });
+
+          data["customField"] = fieldValues?.concat(fieldValuesForCohort);
+          results.userDetails.push(data);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  public async createCohortMembers(
+    loginUser: any,
+    cohortMembers: CohortMembersDto,
+    res: Response,
+    tenantId: string,
+    deviceId: string,
+    academicYearId: string
+  ) {
+    const apiId = APIID.COHORT_MEMBER_CREATE;
+    try {
+      const existUser = await this.usersRepository.find({
+        where: {
+          userId: cohortMembers.userId,
+        },
+      });
+      if (existUser.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.BAD_REQUEST,
+          API_RESPONSES.INVALID_USERID,
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      // check year is live or not
+      const academicYear = await this.academicyearService.getActiveAcademicYear(
+        academicYearId,
+        tenantId
+      );
+
+      if (!academicYear) {
+        return APIResponse.error(
+          res,
+          apiId,
+          HttpStatus.NOT_FOUND.toLocaleString(),
+          API_RESPONSES.ACADEMICYEAR_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+      //check this cohort exist this year or not
+      const isExistAcademicYear = await this.findCohortAcademicYearId(
+        academicYearId,
+        cohortMembers
+      );
+      if (!isExistAcademicYear) {
+        return APIResponse.error(
+          res,
+          apiId,
+          HttpStatus.NOT_FOUND.toLocaleString(),
+          API_RESPONSES.ACADEMICYEAR_COHORT_NOT_FOUND,
+          HttpStatus.NOT_FOUND
+        );
+      }
+      const cohortAcademicYearId = isExistAcademicYear.cohortAcademicYearId;
+      //check user is already exist in this cohort for this year or not
+      const existrole = await this.cohortMembersRepository.find({
+        where: {
+          userId: cohortMembers.userId,
+          cohortId: cohortMembers.cohortId,
+          cohortAcademicYearId: cohortAcademicYearId,
+        },
+      });
+      if (existrole.length > 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          API_RESPONSES.CONFLICT,
+          `User '${cohortMembers.userId}' is already assigned to cohort '${cohortMembers.cohortId}'.`,
+          HttpStatus.CONFLICT
+        );
+      }
+
+      cohortMembers.createdBy = loginUser;
+      cohortMembers.updatedBy = loginUser;
+      cohortMembers.cohortAcademicYearId = cohortAcademicYearId;
+      // Create a new CohortMembers entity and populate it with cohortMembers data
+      const savedCohortMember = await this.cohortMembersRepository.save(
+        cohortMembers
+      );
+
+      if (savedCohortMember) {
+        // Send audit log
+        const auditCtx = getAuditContext();
+        this.emitAuditSafely({
+          entityType: "COHORT_MEMBER",
+          entityId: savedCohortMember.cohortMembershipId,
+          eventAction: "CREATED",
+          ...auditCtx,
+          metadata: {
+            cohortId: cohortMembers.cohortId,
+            userId: cohortMembers.userId,
+            role: cohortMembers.cohortMemberRole,
+            status: cohortMembers.status || 'active'
+          }
+        });
+
+        const apiResponse = APIResponse.success(
+          res,
+          apiId,
+          savedCohortMember,
+          HttpStatus.OK,
+          API_RESPONSES.COHORTMEMBER_CREATED_SUCCESSFULLY
+        );
+
+        await this.cacheService.invalidate([`cohortmember:${savedCohortMember.tenantId}`, `userlist:${savedCohortMember.tenantId}`]);
+
+        const enrichedData = {
+          ...savedCohortMember,
+          academicYearId,
+        };
+
+        this.kafkaService.publishCohortMemberEvent('created', enrichedData, enrichedData.cohortMembershipId).catch(error => {
+          LoggerUtil.error(
+            `Failed to publish cohort member created event to Kafka`,
+            `Error: ${error.message}`, 
+            enrichedData.cohortAcademicYearId
+          )
+        })
+        return apiResponse;
+      }
+    } catch (e) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${e.message}`,
+        apiId
+      )
+      const errorMessage = e.message || API_RESPONSES.INTERNAL_SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.INTERNAL_SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  async findCohortAcademicYearId(academicyearId, cohortMembers) {
+    return await this.cohortAcademicYearRespository.findOne({
+      where: {
+        academicYearId: academicyearId,
+        cohortId: cohortMembers.cohortId,
+      },
+    });
+  }
+
+  async getUsers(where: any, options: any, order: any, tenantId: string) {
+    let whereCase = ``;
+    let limit, offset;
+    const whereConditions: string[] = [];
+
+    // Always add tenantId filter
+    if (tenantId) {
+      whereConditions.push(`UTM."tenantId"='${tenantId}'`);
+    }
+
+    if (where.length > 0) {
+      const processCondition = ([key, value]) => {
+        switch (key) {
+          case "role":
+            return `R."name"='${value}'`;
+          case "status": {
+            const statusValues = Array.isArray(value)
+              ? value.map((status) => `'${status}'`).join(", ")
+              : `'${value}'`;
+            return `CM."status" IN (${statusValues})`;
+          }
+          case "firstName": {
+            return `U."firstName" ILIKE '%${value}%'`;
+          }
+          case "middleName": {
+            return `U."middleName" ILIKE '%${value}%'`;
+          }
+          case "lastName": {
+            return `U."lastName" ILIKE '%${value}%'`;
+          }
+          case "name": {
+            return `U."name" ILIKE '%${value}%'`;
+          }
+          case "cohortAcademicYearId": {
+            const cohortIdAcademicYear = Array.isArray(value)
+              ? value.map((id) => `'${id}'`).join(", ")
+              : `'${value}'`;
+            return `CM."cohortAcademicYearId" IN (${cohortIdAcademicYear})`;
+          }
+          case "cohortMemberRole": {
+            const roleValues = Array.isArray(value)
+              ? value.map((r) => `'${r}'`).join(", ")
+              : `'${value}'`;
+            return `CM."cohortMemberRole" IN (${roleValues})`;
+          }
+          default: {
+            return `CM."${key}"='${value}'`;
+          }
+        }
+      };
+      whereConditions.push(...where.map(processCondition));
+    }
+
+    if (whereConditions.length > 0) {
+      whereCase = "WHERE " + whereConditions.join(" AND ");
+    }
+
+    let query = `SELECT 
+  U."userId", 
+  U."enrollmentId", 
+  U."username", 
+  U."firstName", 
+  U."middleName", 
+  U."lastName", 
+  R."name" AS role, 
+  U."mobile",
+  U."deviceId",
+  CM."status", 
+  CM."statusReason",
+  CM."cohortMembershipId",
+  CM."cohortMemberRole",
+  CM."createdAt", 
+  CM."updatedAt",
+  U."createdBy",
+  U."updatedBy",
+  COUNT(*) OVER() AS total_count
+FROM public."CohortMembers" CM
+INNER JOIN public."Users" U
+  ON CM."userId" = U."userId"
+INNER JOIN public."UserTenantMapping" UTM
+  ON U."userId" = UTM."userId"
+INNER JOIN public."UserRolesMapping" UR
+  ON UR."userId" = U."userId" AND UR."tenantId" = UTM."tenantId"
+INNER JOIN public."Roles" R
+  ON R."roleId" = UR."roleId"
+${whereCase}`;
+    options.forEach((option) => {
+      if (option[0] === "limit") {
+        limit = option[1];
+      }
+      if (option[0] === "offset") {
+        offset = option[1];
+      }
+    });
+
+    if (order && Object.keys(order).length > 0) {
+      const orderField = Object.keys(order)[0];
+      const orderDirection =
+        order[orderField].toUpperCase() === "ASC" ? "ASC" : "DESC";
+      query += ` ORDER BY U."${orderField}" ${orderDirection}`;
+    }
+
+    if (limit !== undefined) {
+      query += ` LIMIT ${limit}`;
+    }
+
+    if (offset !== undefined) {
+      query += ` OFFSET ${offset}`;
+    }
+    const result = await this.usersRepository.query(query);
+
+    return result;
+  }
+
+  public async updateCohortMembers(
+    request: any,
+    cohortMembershipId: string,
+    loginUser: any,
+    cohortMembersUpdateDto: CohortMembersUpdateDto,
+    res
+  ) {
+    const apiId = APIID.COHORT_MEMBER_UPDATE;
+    try {
+      cohortMembersUpdateDto.updatedBy = loginUser;
+      if (!isUUID(cohortMembershipId)) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "Bad Request",
+          "Invalid input: Please Enter a valid UUID for cohortMembershipId.",
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      //validate custom fileds
+      let customFieldValidate;
+      if (
+        cohortMembersUpdateDto.customFields &&
+        cohortMembersUpdateDto.customFields.length > 0
+      ) {
+        customFieldValidate =
+          await this.fieldsService.validateCustomFieldByContext(
+            cohortMembersUpdateDto,
+            "COHORTMEMBER",
+            "COHORTMEMBER"
+          );
+        if (!customFieldValidate) {
+          return APIResponse.error(
+            res,
+            apiId,
+            "BAD_REQUEST",
+            `${customFieldValidate}`,
+            HttpStatus.BAD_REQUEST
+          );
+        }
+      }
+
+      let cohortMembershipToUpdate = await this.cohortMembersRepository.findOne({
+        where: { cohortMembershipId: cohortMembershipId },
+      });
+
+      if (!cohortMembershipToUpdate) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "Not Found",
+          "Invalid input: Cohort member not found.",
+          HttpStatus.NOT_FOUND
+        );
+      }
+      Object.assign(cohortMembershipToUpdate, cohortMembersUpdateDto);
+      let result = await this.cohortMembersRepository.save(
+        cohortMembershipToUpdate
+      );
+
+      // Audit Log
+      const auditCtx = getAuditContext();
+      this.emitAuditSafely({
+        entityType: "COHORT_MEMBER",
+        entityId: cohortMembershipId,
+        eventAction: "UPDATED",
+        ...auditCtx,
+        metadata: {
+          cohortMembershipId: cohortMembershipId,
+          updates: cohortMembersUpdateDto,
+        },
+      });
+      await this.publishCohortMemberEvent(
+        "updated",
+        cohortMembershipToUpdate,
+        apiId
+      );
+      if (!result) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "Internal Server Error",
+          "Failed to update cohort member.",
+          HttpStatus.INTERNAL_SERVER_ERROR
+        );
+      }
+
+      const cohortDetails = await this.cohortRepository.findOne({
+        where: {
+          cohortId: cohortMembershipToUpdate.cohortId,
+        },
+      });
+      if (!cohortDetails) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "Not Found",
+          "Invalid input: Cohort not found.",
+          HttpStatus.NOT_FOUND
+        );
+      }
+      const additionalData = {
+        tenantId: cohortDetails.tenantId,
+        contextType: "COHORTMEMBER",
+        createdBy: cohortMembershipToUpdate.createdBy,
+        updatedBy: cohortMembershipToUpdate.updatedBy,
+      }
+
+      // Membership row already saved above — bump the owning tenant's lists.
+      if (cohortDetails.tenantId) {
+        await this.cacheService.invalidate([`cohortmember:${cohortDetails.tenantId}`, `userlist:${cohortDetails.tenantId}`]);
+      }
+
+      //update custom fields
+      let responseForCustomField;
+      if (
+        cohortMembersUpdateDto.customFields &&
+        cohortMembersUpdateDto.customFields.length > 0
+      ) {
+        const customFields = cohortMembersUpdateDto.customFields;
+        delete cohortMembersUpdateDto.customFields;
+        Object.assign(cohortMembershipToUpdate, cohortMembersUpdateDto);
+
+        responseForCustomField = await this.processCustomFields(
+          customFields,
+          cohortMembershipId,
+          cohortMembersUpdateDto,
+          additionalData
+        );
+        if (result && responseForCustomField.success) {
+          APIResponse.success(
+            res,
+            apiId,
+            [],
+            HttpStatus.CREATED,
+            API_RESPONSES.COHORTMEMBER_UPDATE_SUCCESSFULLY
+          );
+
+          await this.publishCohortMemberEvent(
+            "updated",
+            cohortMembershipToUpdate,
+            apiId
+          );
+        } else {
+          const errorMessage =
+            responseForCustomField.error || "Internal server error";
+          return APIResponse.error(
+            res,
+            apiId,
+            "Internal Server Error",
+            errorMessage,
+            HttpStatus.INTERNAL_SERVER_ERROR
+          );
+        }
+      } else {
+        APIResponse.success(
+          res,
+          apiId,
+          [],
+          HttpStatus.OK,
+          API_RESPONSES.COHORTMEMBER_UPDATE_SUCCESSFULLY
+        );
+      }
+    } catch (error) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${error.message}`,
+        apiId
+      )
+
+      return APIResponse.error(
+        response,
+        apiId,
+        API_RESPONSES.INTERNAL_SERVER_ERROR,
+        `Error : ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+
+
+  }
+
+  public async deleteCohortMemberById(
+    tenantid: any,
+    cohortMembershipId: any,
+    res: any
+  ) {
+    const apiId = APIID.COHORT_MEMBER_DELETE;
+
+    try {
+      const cohortMember = await this.cohortMembersRepository.find({
+        where: {
+          cohortMembershipId: cohortMembershipId,
+        },
+      });
+
+      if (!cohortMember || cohortMember.length === 0) {
+        return APIResponse.error(
+          res,
+          apiId,
+          "Not Found",
+          "Invalid input: Cohort member not found.",
+          HttpStatus.NOT_FOUND
+        );
+      }
+
+      const result = await this.cohortMembersRepository.delete(
+        cohortMembershipId
+      );
+
+      if (tenantid) {
+        await this.cacheService.invalidate([`cohortmember:${tenantid}`, `userlist:${tenantid}`]);
+      }
+
+      return APIResponse.success(
+        res,
+        apiId,
+        result,
+        HttpStatus.OK,
+        "Cohort Member deleted Successfully."
+      );
+    } catch (e) {
+      LoggerUtil.error(
+        `${API_RESPONSES.SERVER_ERROR}`,
+        `Error: ${e.message}`,
+        apiId
+      )
+      const errorMessage = e.message || API_RESPONSES.SERVER_ERROR;
+      return APIResponse.error(
+        res,
+        apiId,
+        API_RESPONSES.SERVER_ERROR,
+        errorMessage,
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  public async checkUserExist(userId) {
+    const existUser = await this.usersRepository.findOne({
+      where: {
+        userId: userId,
+      },
+    });
+    return existUser;
+  }
+
+  public async checkCohortExist(cohortId) {
+    const existCohort = await this.cohortRepository.findOne({
+      where: {
+        cohortId: cohortId,
+      },
+    });
+    if (!existCohort) {
+      return false;
+    }
+    return existCohort;
+  }
+
+  public async cohortUserMapping(userId, cohortId, cohortAcademicYearId) {
+    const mappingExist = await this.cohortMembersRepository.findOne({
+      where: {
+        userId: userId,
+        cohortId: cohortId,
+        cohortAcademicYearId: cohortAcademicYearId,
+        status: MemberStatus.ACTIVE,
+      },
+    });
+
+    return mappingExist;
+  }
+
+  /**
+   * Find any existing cohort member mapping regardless of status.
+   * Used during bulk cohort member addition to decide update vs insert.
+   */
+  public async findAnyMappingForYear(
+    userId: string,
+    cohortId: string,
+    cohortAcademicYearId: string
+  ): Promise<CohortMembers | null> {
+    return this.cohortMembersRepository.findOne({
+      where: {
+        userId,
+        cohortId,
+        cohortAcademicYearId,
+      },
+    });
+  }
+
+  public async createBulkCohortMembers(
+    loginUser: any,
+    cohortMembersDto: BulkCohortMember,
+    response: Response,
+    tenantId: string,
+    academicyearId: string
+  ) {
+    const apiId = APIID.COHORT_MEMBER_CREATE;
+    const results = [];
+    const errors = [];
+    const cohortMembersBase: any = {
+      createdBy: loginUser,
+      updatedBy: loginUser,
+      tenantId: tenantId,
+      // cohortAcademicYearId: academicyearId
+    };
+    if (cohortMembersDto.status) {
+      cohortMembersBase.status = cohortMembersDto.status;
+    }
+
+    // Track users that were successfully added to cohorts for Kafka event publishing
+    const affectedUsers = new Set<string>();
+
+    const academicYear = await this.academicyearService.getActiveAcademicYear(
+      academicyearId,
+      tenantId
+    );
+    if (!academicYear) {
+      return APIResponse.error(
+        response,
+        apiId,
+        HttpStatus.NOT_FOUND.toLocaleString(),
+        API_RESPONSES.ACADEMICYEAR_NOT_FOUND,
+        HttpStatus.NOT_FOUND
+      );
+    }
+
+    for (const userId of cohortMembersDto.userId) {
+      // why checking from user table because it is possible to make first time part of any cohort
+      const userExists = await this.checkUserExist(userId);
+      if (!userExists) {
+        errors.push(API_RESPONSES.USER_NOTEXIST(userId));
+        continue;
+      }
+
+      // Handling of Removing Cohort from user
+      if (
+        cohortMembersDto?.removeCohortId &&
+        cohortMembersDto?.removeCohortId.length > 0
+      ) {
+        for (const removeCohortId of cohortMembersDto.removeCohortId) {
+          try {
+            const cohortExists = await this.isCohortExistForYear(
+              academicyearId,
+              removeCohortId
+            );
+            if (cohortExists.length === 0) {
+              errors.push(
+                API_RESPONSES.COHORTID_NOTFOUND_FOT_THIS_YEAR(removeCohortId)
+              );
+              continue;
+            }
+            const updateCohort = await this.cohortMembersRepository.update(
+              {
+                userId,
+                cohortId: removeCohortId,
+                cohortAcademicYearId: cohortExists[0].cohortAcademicYearId,
+              },
+              { status: MemberStatus.REASSIGNED }
+            );
+            if (updateCohort.affected === 0) {
+              results.push({
+                message: API_RESPONSES.COHORT_NOTMAPPED_WITH_USER(
+                  removeCohortId,
+                  userId
+                ),
+              });
+            } else {
+              results.push({
+                message: API_RESPONSES.COHORT_STATUS_UPDATED_FOR_USER(
+                  removeCohortId,
+                  userId
+                ),
+              });
+            affectedUsers.add(userId);
+            }
+          } catch (error) {
+            LoggerUtil.error(
+              `${API_RESPONSES.SERVER_ERROR}`,
+              `Error: ${error.message}`,
+              apiId
+            )
+            errors.push(
+              API_RESPONSES.ERROR_UPDATE_COHORTMEMBER(
+                userId,
+                removeCohortId,
+                error.message
+              )
+            );
+          }
+        }
+      }
+
+      // Handling of Addition of User in Cohort
+      if (
+        cohortMembersDto?.cohortId &&
+        cohortMembersDto?.cohortId.length > 0
+      ) {
+        for (const cohortId of cohortMembersDto.cohortId) {
+          const cohortMemberBase = {
+            ...cohortMembersBase,
+            userId: userId,
+            cohortId: cohortId,
+            ...(cohortMembersDto.cohortMemberRole && { cohortMemberRole: cohortMembersDto.cohortMemberRole }),
+          };
+          try {
+            // Verify cohort is mapped to the active academic year
+            const cohortExists = await this.isCohortExistForYear(
+              academicyearId,
+              cohortId
+            );
+            if (cohortExists.length === 0) {
+              errors.push(
+                API_RESPONSES.COHORTID_NOTFOUND_FOT_THIS_YEAR(cohortId)
+              );
+              continue;
+            }
+
+            const cohortAcademicYearId = cohortExists[0].cohortAcademicYearId;
+
+            // Check if a mapping already exists (any status) for this user+cohort+academicYear
+            const existingMapping = await this.findAnyMappingForYear(
+              userId,
+              cohortId,
+              cohortAcademicYearId
+            );
+
+            if (existingMapping) {
+              // Update status, updatedBy, and cohortMemberRole (if provided) while preserving original entity fields
+let updatedMapping;
+              if(tenantId === '6c8b810a-66c2-4f0d-8c0c-c025415a4414') {
+                  updatedMapping = {
+                ...existingMapping,
+                ...(cohortMembersDto.cohortMemberRole && { cohortMemberRole: cohortMembersDto.cohortMemberRole }),
+                status:cohortMembersDto.status ?? MemberStatus.ACTIVE,
+                updatedBy: loginUser,
+              };  
+              }else {
+               updatedMapping = {
+                ...existingMapping,
+                ...(cohortMembersDto.cohortMemberRole && { cohortMemberRole: cohortMembersDto.cohortMemberRole }),
+                status:  MemberStatus.ACTIVE,
+                updatedBy: loginUser,
+              };
+            }
+              const result = await this.cohortMembersRepository.save(updatedMapping);
+              results.push(result);
+            } else {
+              // No mapping found → insert new cohort member record
+              const cohortMemberForAcademicYear = {
+                ...cohortMemberBase,
+                cohortAcademicYearId,
+              };
+              const result = await this.cohortMembersRepository.save(
+                cohortMemberForAcademicYear
+              );
+              results.push(result);
+            }
+
+            // Track user for Kafka event publishing
+            affectedUsers.add(userId);
+          } catch (error) {
+            LoggerUtil.error(
+              `${API_RESPONSES.SERVER_ERROR}`,
+              `Error: ${error.message}`,
+              apiId
+            );
+            errors.push(
+              API_RESPONSES.ERROR_SAVING_COHORTMEMBER(
+                userId,
+                cohortId,
+                error.message
+              )
+            );
+          }
+        }
+      }
+    }
+
+    APIResponse.success(
+      response,
+      APIID.COHORT_MEMBER_CREATE,
+      results,
+      HttpStatus.CREATED,
+      API_RESPONSES.COHORTMEMBER_SUCCESSFULLY
+    );
+
+    // Publish Kafka events for affected users after successful bulk operations
+    // Use Promise.allSettled to ensure one failed event doesn't stop others
+
+    LoggerUtil.log(
+      `Publishing user events for ${affectedUsers.size} users`,
+      apiId
+    );
+
+    // Membership changes alter /list results that use exclude.cohortIds.
+    if (affectedUsers.size > 0) {
+      await this.cacheService.invalidate([
+        ...Array.from(affectedUsers).map((id) => `user:${id}`),
+        `cohortmember:${tenantId}`,
+        `userlist:${tenantId}`,
+      ]);
+    }
+
+    const publishPromises = Array.from(affectedUsers).map(async (userId) => {
+      try {
+        // Directly call publishUserEvent with 'updated' type since users joined new cohorts
+        this.userService.publishUserEvent('updated', userId, apiId);
+        LoggerUtil.log(`User event published for user: ${userId}`, apiId);
+      } catch (error) {
+        LoggerUtil.error(
+          `Failed to publish user event for user: ${userId}`,
+          `Error: ${error.message}`,
+          apiId
+        );
+        // Don't throw - we don't want Kafka failures to affect the main operation
+      }
+    });
+
+    await Promise.allSettled(publishPromises);
+
+    if (errors.length > 0) {
+      return APIResponse.success(
+        response,
+        APIID.COHORT_MEMBER_CREATE,
+        { results, errors },
+        HttpStatus.CREATED,
+        API_RESPONSES.COHORTMEMBER_ERROR
+      );
+    }
+
+  }
+
+  public async registerFieldValue(
+    fieldId: string,
+    value: any,
+    itemId: string,
+    loggedInUserId: string,
+    additionalData?: { tenantId?: string, contextType?: string, createdBy?: string, updatedBy?: string }
+  ) {
+    //create
+    // const registerResponse = await this.fieldsService.findAndSaveFieldValues({
+    //   createdAt: new Date(),
+    //   updatedAt: new Date(),
+    //   fieldId: fieldId,
+    //   value: value,
+    //   itemId: itemId,
+    //   createdBy: loggedInUserId,
+    //   updatedBy: loggedInUserId,
+    // });
+    // //update
+    // if (!registerResponse) {
+    const updateResponse = await this.fieldsService.updateCustomFields(
+      itemId,
+      {
+        updatedAt: new Date(),
+        value: JSON.stringify(value),
+        fieldId: fieldId,
+        updatedBy: loggedInUserId,
+      },
+      null,
+      additionalData
+    );
+    if (updateResponse) {
+      return true;
+    } else {
+      return false;
+      // }
+    }
+  }
+  async processCustomFields(
+    customFields: FieldValuesOptionDto[],
+    cohortMembershipId: string,
+    cohortMembersUpdateDto: CohortMembersUpdateDto,
+    additionalData: { tenantId?: string, contextType?: string, createdBy?: string, updatedBy?: string }
+  ) {
+    try {
+      const promises = customFields.map((customField) =>
+        this.registerFieldValue(
+          customField.fieldId,
+          customField.value,
+          cohortMembershipId,
+          cohortMembersUpdateDto.userId,
+          additionalData
+        )
+      );
+
+      const results = await Promise.all(promises);
+
+      return { success: true, data: results };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Publish cohort member events by delegating to user event publisher
+   * Fetches the userId from cohortMembershipId and publishes a user event.
+   */
+  public async publishCohortMemberEvent(
+    eventType: "created" | "updated" | "deleted",
+    cohortMembershipToUpdate,
+    apiId: string
+  ): Promise<void> {
+    // Callers invoke this right after their membership write commits, so it
+    // doubles as the invalidation point for single-member update/delete.
+    if (cohortMembershipToUpdate?.tenantId) {
+      await this.cacheService.invalidate([`cohortmember:${cohortMembershipToUpdate.tenantId}`, `userlist:${cohortMembershipToUpdate.tenantId}`]);
+    }
+    try {
+      // Prepare payload depending on event type
+      let cohortMemberData: any;
+
+      if (eventType === "deleted") {
+        cohortMemberData = {
+          cohortMembershipId: cohortMembershipToUpdate.cohortMembershipId,
+          deletedAt: new Date().toISOString(),
+        };
+      } else {
+        // Fetch only the custom fields we care about and send a minimal payload
+        let membershipCustomFields = [] as any[];
+        try {
+          const fields = await this.fieldsService.getFieldsAndFieldsValues(
+            cohortMemberData.cohortMembershipId
+          );
+          // Keep only 4 target fields by label (case-insensitive) with minimal shape { label, value }
+          const wanted = new Set(["subject", "fees", "registration", "board"]);
+          membershipCustomFields = (fields || [])
+            .map((field: any) => ({
+              label: field?.label,
+              value: field?.value,
+              selectedValues: field?.selectedValues,
+            }))
+            .filter((f: any) =>
+              wanted.has((f?.label || "").toString().trim().toLowerCase())
+            )
+            .map((f: any) => ({
+              label: f?.label,
+              // Prefer direct value; if absent, derive a string from selectedValues
+              value:
+                f?.value ??
+                (Array.isArray(f?.selectedValues)
+                  ? f.selectedValues
+                    .map(
+                      (v: any) =>
+                        v?.value ??
+                        v?.label ??
+                        v?.name ??
+                        v?.id ??
+                        (typeof v === "string" ? v : null)
+                    )
+                    .filter((v: any) => v != null)
+                    .join(",")
+                  : null),
+            }));
+        } catch (cfError) {
+          LoggerUtil.error(
+            `Failed to fetch cohort member custom fields`,
+            `Error: ${cfError.message}`,
+            apiId
+          );
+        }
+
+        cohortMemberData = {
+          cohortMembershipId: cohortMembershipToUpdate.cohortMembershipId,
+          customFields: membershipCustomFields,
+          eventTimestamp: new Date().toISOString(),
+        };
+      }
+
+      await this.kafkaService.publishCohortMemberEvent(
+        eventType,
+        cohortMembershipToUpdate,
+        cohortMemberData.cohortMembershipId
+      );
+      LoggerUtil.log(
+        `Cohort member ${eventType} event published to Kafka for cohortMembershipId ${cohortMemberData.cohortMembershipId}`,
+        apiId
+      );
+    } catch (error) {
+      LoggerUtil.error(
+        `Failed to publish cohort member ${eventType} event`,
+        `Error: ${error.message}`,
+        apiId
+      );
+    }
+  }
+}

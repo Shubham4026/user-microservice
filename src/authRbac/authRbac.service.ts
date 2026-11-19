@@ -1,12 +1,16 @@
 import {
   BadRequestException,
+  HttpStatus,
   Injectable,
   UnauthorizedException,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { PostgresRoleService } from "src/adapters/postgres/rbac/role-adapter";
-import { UserAdapter } from "src/user/useradapter";
+import { RoleService } from "src/rbac/role/role.service";
+import APIResponse from "src/common/responses/response";
+import { UserService } from "src/user/user.service";
+import { Response } from "express";
+import { APIID } from "src/common/utils/api-id.config";
 
 @Injectable()
 export class AuthRbacService {
@@ -17,8 +21,8 @@ export class AuthRbacService {
   constructor(
     private jwtService: JwtService,
     private configService: ConfigService,
-    private readonly userAdapter: UserAdapter,
-    private readonly postgresRoleService: PostgresRoleService
+    private readonly userService: UserService,
+    private readonly roleService: RoleService
   ) {
     this.issuer = this.configService.get<string>("ISSUER");
     this.audience = this.configService.get<string>("AUDIENCE");
@@ -35,24 +39,38 @@ export class AuthRbacService {
     return token;
   }
 
-  async signInRbac(username: string, tenantId: string): Promise<any> {
-    let userData = await this.userAdapter
-      .buildUserAdapter()
+  async signInRbac(
+    username: string,
+    tenantId: string,
+    response: Response
+  ): Promise<any> {
+    const apiId = APIID.RBAC_TOKEN;
+    const userData = await this.userService
       .findUserDetails(null, username);
 
     if (!userData || !tenantId) {
-      throw new BadRequestException(
-        "User details or tenant not found for user"
+      return APIResponse.error(
+        response,
+        apiId,
+        "Bad Request",
+        "User details or tenant not found for user",
+        HttpStatus.BAD_REQUEST
       );
     }
 
-    const userRoles = await this.postgresRoleService.findUserRoleData(
+    const userRoles = await this.roleService.findUserRoleData(
       userData?.userId,
       tenantId
     );
 
     if (!userRoles?.length) {
-      throw new BadRequestException("Roles not found for user");
+      return APIResponse.error(
+        response,
+        apiId,
+        "Bad Request",
+        "Roles not found for user",
+        HttpStatus.BAD_REQUEST
+      );
     }
 
     userData["roles"] = userRoles.map(({ code }) => code);
@@ -68,9 +86,16 @@ export class AuthRbacService {
       aud: audience,
     };
 
-    return {
+    const result = {
       access_token: await this.generateToken(payload),
     };
+    return await APIResponse.success(
+      response,
+      apiId,
+      result,
+      HttpStatus.OK,
+      "User and related entries deleted Successfully."
+    );
   }
 
   async getPrivileges(userRoleData) {
@@ -78,7 +103,7 @@ export class AuthRbacService {
     if (!roleIds.length) {
       return [];
     }
-    const privilegesData = await this.postgresRoleService.findPrivilegeByRoleId(
+    const privilegesData = await this.roleService.findPrivilegeByRoleId(
       roleIds
     );
 

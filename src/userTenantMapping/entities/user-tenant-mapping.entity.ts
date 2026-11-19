@@ -1,48 +1,61 @@
 import {
-    Entity,
-    PrimaryGeneratedColumn,
-    Column,
-    CreateDateColumn,
-    UpdateDateColumn,
-    ManyToOne,
-    JoinColumn,
-  } from "typeorm";
-  import { User } from "src/user/entities/user-entity";
-  
-  @Entity({ name: "UserTenantMapping" })
-  export class UserTenantMapping {
-    @PrimaryGeneratedColumn("uuid")
-    Id: string;
-  
-    @Column("uuid")
-    userId: string;
-  
-    @Column("uuid")
-    tenantId: string;
-  
-    @CreateDateColumn({
-      type: "timestamp with time zone",
-      default: () => "CURRENT_TIMESTAMP",
-    })
-    createdAt: Date;
-  
-    @UpdateDateColumn({
-      type: "timestamp with time zone",
-      default: () => "CURRENT_TIMESTAMP",
-    })
-    updatedAt: Date;
-  
-    @Column()
-    createdBy: string;
-  
-    @Column()
-    updatedBy: string;
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  ManyToOne,
+  JoinColumn,
+} from "typeorm";
+import { User } from "src/user/entities/user-entity";
 
+export enum UserTenantMappingStatus {
+  ACTIVE = "active",
+  INACTIVE = "inactive",
+  ARCHIVED = "archived",
+  PENDING = "pending",
+}
 
+@Entity({ name: "UserTenantMapping" })
+export class UserTenantMapping {
+  @PrimaryGeneratedColumn("uuid")
+  Id: string;
 
-    @ManyToOne(() => User, user => user.userTenantMapping)
-    @JoinColumn({ name: 'userId' })
-    user: User; 
+  @Column("uuid")
+  userId: string;
 
-  }
-  
+  @Column("uuid")
+  tenantId: string;
+
+  @Column({
+    type: "enum",
+    enum: UserTenantMappingStatus,
+    default: UserTenantMappingStatus.ACTIVE,
+  })
+  status: UserTenantMappingStatus;
+
+  @Column({ type: "text", nullable: true })
+  reason: string;
+
+  @CreateDateColumn({
+    type: "timestamp with time zone",
+    default: () => "CURRENT_TIMESTAMP",
+  })
+  createdAt: Date;
+
+  @UpdateDateColumn({
+    type: "timestamp with time zone",
+    default: () => "CURRENT_TIMESTAMP",
+  })
+  updatedAt: Date;
+
+  @Column()
+  createdBy: string;
+
+  @Column()
+  updatedBy: string;
+
+  @ManyToOne(() => User, (user) => user.userTenantMapping)
+  @JoinColumn({ name: "userId" })
+  user: User;
+}
